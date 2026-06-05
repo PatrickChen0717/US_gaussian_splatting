@@ -1,0 +1,17 @@
+python vanilla_gaussian_splatting.py `
+  --image-dir "C:\Users\Patrick\Documents\MAsc\EchoRaccoon\dataset\trial2.igs.mha" `
+  --grayscale `
+  --init svrtk `
+  --densify-every 50 `
+  --densify-start 100 `
+  --num-gaussians 2000 `
+  --max-gaussians 50000 `
+  --render-chunk-size 32 `
+  --steps 10000 `
+  --debug-every 25 `
+  --grayscale `
+  --filter-kernel-size 9 `
+  --filter-sigma 1 `
+  --sobel-loss-weight 1.5 `
+  --height 256 `
+  --width 256
