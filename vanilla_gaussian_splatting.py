@@ -144,6 +144,9 @@ class VanillaGaussianSplatting(nn.Module):
         log_prior = prior.clamp_min(min_scale_mm).log()
         return F.mse_loss(scales.log(), log_prior.expand_as(scales.log()))
 
+    def opacity_sparsity_loss(self):
+        return torch.sigmoid(self.logit_opacities).mean()
+
     @torch.no_grad()
     def stabilize_parameters(self, min_scale_mm=0.05, max_scale_mm=10.0):
         self.means.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
@@ -397,6 +400,11 @@ def save_checkpoint(
             "edge_weight": args.edge_loss_weight,
             "intensity_weight": args.intensity_loss_weight,
             "sobel_weight": args.sobel_loss_weight,
+            "volume_raw_weight": args.volume_raw_weight,
+            "volume_edge_weight": args.volume_edge_weight,
+            "volume_background_weight": args.volume_background_weight,
+            "volume_background_threshold": args.volume_background_threshold,
+            "opacity_sparsity_weight": args.opacity_sparsity_weight,
             "filter_kernel_size": args.filter_kernel_size,
             "filter_sigma": args.filter_sigma,
             "low_intensity_threshold_255": args.low_intensity_threshold,
@@ -768,6 +776,44 @@ def prediction_loss(pred, target, args, model=None):
             content_feature_threshold=args.content_feature_threshold,
             content_background_weight=args.content_background_weight,
         )
+    elif args.loss == "volume_l1":
+        pred_bchw = pred.unsqueeze(0) if pred.ndim == 3 else pred
+        target_bchw = target.unsqueeze(0) if target.ndim == 3 else target
+        loss = F.l1_loss(pred_bchw, target_bchw) * args.volume_raw_weight
+
+        if args.volume_edge_weight > 0.0:
+            edge_loss = ultrasound_edge_loss(
+                pred,
+                target,
+                laplacian_weight=args.laplacian_loss_weight,
+                edge_weight=args.edge_loss_weight,
+                intensity_weight=0.0,
+                sobel_weight=args.sobel_loss_weight,
+                sigmas=(args.filter_sigma,),
+                kernel_size=args.filter_kernel_size,
+                sobel_blur_kernel_size=args.filter_kernel_size,
+                sobel_blur_sigma=args.filter_sigma,
+                use_confidence=args.use_confidence,
+                background_threshold=args.confidence_background_threshold,
+                background_weight=args.confidence_background_weight,
+                dark_threshold=args.confidence_dark_threshold,
+                shadow_weight=args.confidence_shadow_weight,
+                bright_threshold=args.confidence_bright_threshold,
+                shadow_start_offset=args.confidence_shadow_start_offset,
+                enable_shadow_confidence=args.shadow_confidence,
+                content_normalize=args.content_normalize,
+                content_intensity_threshold=args.content_intensity_threshold,
+                content_feature_threshold=args.content_feature_threshold,
+                content_background_weight=args.content_background_weight,
+            )
+            loss = loss + args.volume_edge_weight * edge_loss
+
+        if args.volume_background_weight > 0.0:
+            target_gray = target_bchw.mean(dim=1, keepdim=True)
+            pred_gray = pred_bchw.mean(dim=1, keepdim=True)
+            background = target_gray <= args.volume_background_threshold
+            if background.any():
+                loss = loss + args.volume_background_weight * pred_gray[background].mean()
     else:
         raw_weight = None
         if args.content_normalize:
@@ -794,6 +840,8 @@ def prediction_loss(pred, target, args, model=None):
             min_scale_mm=args.min_scale_mm,
             max_scale_mm=args.max_scale_mm,
         )
+    if model is not None and args.opacity_sparsity_weight > 0.0:
+        loss = loss + args.opacity_sparsity_weight * model.opacity_sparsity_loss()
     return loss
 
 
@@ -1153,11 +1201,41 @@ def parse_args():
     parser.add_argument("--intensity-threshold", type=float, default=0.05)
     parser.add_argument("--shadowing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shadow-strength", type=float, default=1.0)
-    parser.add_argument("--loss", choices=("ultrasound_edges", "raw_l1"), default="ultrasound_edges")
+    parser.add_argument("--loss", choices=("ultrasound_edges", "raw_l1", "volume_l1"), default="ultrasound_edges")
     parser.add_argument("--laplacian-loss-weight", type=float, default=1.0)
     parser.add_argument("--edge-loss-weight", type=float, default=1.0)
     parser.add_argument("--intensity-loss-weight", type=float, default=0.05)
     parser.add_argument("--sobel-loss-weight", type=float, default=1.5)
+    parser.add_argument(
+        "--volume-raw-weight",
+        type=float,
+        default=1.0,
+        help="Raw intensity L1 weight for --loss volume_l1.",
+    )
+    parser.add_argument(
+        "--volume-edge-weight",
+        type=float,
+        default=0.25,
+        help="Auxiliary ultrasound edge/detail weight for --loss volume_l1.",
+    )
+    parser.add_argument(
+        "--volume-background-weight",
+        type=float,
+        default=0.5,
+        help="Penalty for predicted brightness where target pixels are dark in --loss volume_l1.",
+    )
+    parser.add_argument(
+        "--volume-background-threshold",
+        type=float,
+        default=0.03,
+        help="Target intensity threshold used by the volume background penalty.",
+    )
+    parser.add_argument(
+        "--opacity-sparsity-weight",
+        type=float,
+        default=0.0,
+        help="Penalty on mean Gaussian opacity to reduce cloudy/saturated reconstructions.",
+    )
     parser.add_argument("--filter-kernel-size", type=int, default=9)
     parser.add_argument("--filter-sigma", type=float, default=1.0)
     parser.add_argument(
