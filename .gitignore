@@ -1,3 +1,5 @@
 __pycache__/
 outputs/
 laplacian_outputs/
+ultragauss_mimic_stage/
+outputs2/

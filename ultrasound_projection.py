@@ -31,6 +31,7 @@ def project_ultrasound_gaussians(
     elevational_depth_slope=0.0,
     primitive_mode="volume",
     disk_normals=None,
+    covariances=None,
 ):
     """
     Project 3D Gaussians onto a tracked ultrasound slice.
@@ -72,7 +73,19 @@ def project_ultrasound_gaussians(
     v = means_image[:, 1] / spacing_y + origin_px[1]
     plane_distance = means_image[:, 2]
 
-    if primitive_mode == "disk":
+    if covariance_mode == "full_cholesky":
+        sigma_image = gaussian_scales_in_image_frame(
+            scales=scales,
+            means_image=means_image,
+            image_t_tracker=image_t_tracker,
+            covariance_mode=covariance_mode,
+            min_scale_mm=min_scale_mm,
+            max_scale_mm=max_scale_mm,
+            lateral_depth_slope=lateral_depth_slope,
+            elevational_depth_slope=elevational_depth_slope,
+            covariances=covariances,
+        )
+    elif primitive_mode == "disk":
         if disk_normals is None:
             raise ValueError("disk_normals must be provided when primitive_mode='disk'")
         sigma_image = gaussian_disk_scales_in_image_frame(
@@ -98,6 +111,7 @@ def project_ultrasound_gaussians(
             max_scale_mm=max_scale_mm,
             lateral_depth_slope=lateral_depth_slope,
             elevational_depth_slope=elevational_depth_slope,
+            covariances=covariances,
         )
     sigma_x = (sigma_image[:, 0] / spacing_x).clamp_min(min_sigma_pixels)
     sigma_y = (sigma_image[:, 1] / spacing_y).clamp_min(min_sigma_pixels)
@@ -147,6 +161,7 @@ def render_ultrasound_gaussians(
     slice_to_world,
     image_height,
     image_width,
+    transmittances=None,
     pixel_spacing=(1.0, 1.0),
     slice_thickness=1.0,
     shadowing=True,
@@ -167,13 +182,15 @@ def render_ultrasound_gaussians(
     attenuation_weight=0.0,
     reflection_weight=0.0,
     scattering_weight=0.0,
+    covariances=None,
 ):
     """
     Render an ultrasound slice from 3D Gaussians.
 
     The image is formed by drawing the intersection of each Gaussian with the
-    tracked slice plane. If shadowing is enabled, near-probe opacity attenuates
-    deeper contributions along the axial image direction.
+    tracked slice plane. If shadowing is enabled, a separate per-Gaussian
+    transmittance can attenuate deeper contributions along the axial image
+    direction.
     """
     projected = project_ultrasound_gaussians(
         means,
@@ -194,6 +211,7 @@ def render_ultrasound_gaussians(
         elevational_depth_slope=elevational_depth_slope,
         primitive_mode=primitive_mode,
         disk_normals=disk_normals,
+        covariances=covariances,
     )
 
     visible = projected["visible"]
@@ -218,6 +236,10 @@ def render_ultrasound_gaussians(
             scattering_weight=scattering_weight,
         )
     opacities = opacities[visible].reshape(-1).sigmoid() * plane_weights
+    if transmittances is None:
+        local_transmittances = None
+    else:
+        local_transmittances = transmittances[visible].reshape(-1).sigmoid()
 
     yy, xx = torch.meshgrid(
         torch.arange(image_height, device=device, dtype=means.dtype),
@@ -231,8 +253,13 @@ def render_ultrasound_gaussians(
         xys = xys[order]
         sigmas = sigmas[order]
         opacities = opacities[order]
+        plane_weights = plane_weights[order]
+        if local_transmittances is not None:
+            local_transmittances = local_transmittances[order]
         colors = colors[order]
-        transmittance = torch.ones((1, image_height, image_width), device=device)
+        accumulated_transmittance = torch.ones(
+            (1, image_height, image_width), device=device
+        )
         for start in range(0, len(xys), max(int(render_chunk_size), 1)):
             end = min(start + max(int(render_chunk_size), 1), len(xys))
             alpha = gaussian_alpha_chunk(
@@ -242,10 +269,40 @@ def render_ultrasound_gaussians(
                 sigmas[start:end],
                 opacities[start:end],
             )
-            for alpha_i, color_i in zip(alpha, colors[start:end]):
+            if local_transmittances is None:
+                shadow_alpha = alpha
+            else:
+                shadow_alpha = gaussian_alpha_chunk(
+                    xx,
+                    yy,
+                    xys[start:end],
+                    sigmas[start:end],
+                    plane_weights[start:end],
+                )
+            for local_index, (alpha_i, shadow_alpha_i, color_i) in enumerate(
+                zip(alpha, shadow_alpha, colors[start:end])
+            ):
                 alpha_i = alpha_i.unsqueeze(0)
-                image = image + transmittance * alpha_i * color_i[:, None, None]
-                transmittance = transmittance * torch.exp(-shadow_strength * alpha_i)
+                shadow_alpha_i = shadow_alpha_i.unsqueeze(0)
+                if local_transmittances is None:
+                    gaussian_transmittance = torch.exp(
+                        -shadow_strength * shadow_alpha_i
+                    )
+                else:
+                    local_t = local_transmittances[start + local_index]
+                    gaussian_transmittance = 1.0 - shadow_alpha_i * (1.0 - local_t)
+                    if shadow_strength != 1.0:
+                        gaussian_transmittance = gaussian_transmittance.clamp_min(
+                            1e-6
+                        ).pow(shadow_strength)
+                image = (
+                    image
+                    + accumulated_transmittance * alpha_i * color_i[:, None, None]
+                )
+                accumulated_transmittance = (
+                    accumulated_transmittance
+                    * gaussian_transmittance.clamp(0.0, 1.0)
+                )
     else:
         for start in range(0, len(xys), max(int(render_chunk_size), 1)):
             end = min(start + max(int(render_chunk_size), 1), len(xys))
@@ -277,6 +334,7 @@ def gaussian_scales_in_image_frame(
     max_scale_mm=10.0,
     lateral_depth_slope=0.0,
     elevational_depth_slope=0.0,
+    covariances=None,
 ):
     """
     Return Gaussian standard deviations in calibrated image coordinates.
@@ -295,6 +353,11 @@ def gaussian_scales_in_image_frame(
 
     if covariance_mode == "world_axis_aligned":
         return project_axis_aligned_covariance_to_image(scales, image_t_tracker)
+
+    if covariance_mode == "full_cholesky":
+        if covariances is None:
+            raise ValueError("covariances must be provided when covariance_mode='full_cholesky'")
+        return project_full_covariance_to_image(covariances, image_t_tracker, min_scale_mm, max_scale_mm)
 
     raise ValueError(f"Unknown covariance_mode: {covariance_mode}")
 
@@ -389,6 +452,20 @@ def project_axis_aligned_covariance_to_image(scales, image_t_tracker):
     return image_variances.clamp_min(1e-12).sqrt()
 
 
+def project_full_covariance_to_image(covariances, image_t_tracker, min_scale_mm=0.05, max_scale_mm=10.0):
+    """
+    Rotate full 3D covariance matrices into calibrated image coordinates.
+
+    covariances are positive-definite matrices built upstream as L @ L.T + eps I.
+    The lightweight rasterizer still uses diagonal standard deviations in image
+    coordinates, but those diagonals now come from a full learnable covariance.
+    """
+    rotation = image_t_tracker[:3, :3]
+    covariance_image = rotation @ covariances @ rotation.T
+    image_variances = covariance_image.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
+    return image_variances.sqrt().clamp(min_scale_mm, max_scale_mm)
+
+
 def _matrix4(matrix, device, dtype):
     matrix = torch.as_tensor(matrix, device=device, dtype=dtype)
     if matrix.shape != (4, 4):
@@ -405,3 +482,4 @@ def _as_anisotropic_scales(scales, device, dtype):
     if scales.shape[-1] != 3:
         raise ValueError("scales must have shape [N], [N, 1], or [N, 3]")
     return scales
+

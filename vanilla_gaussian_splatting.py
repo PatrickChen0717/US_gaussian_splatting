@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Subset
 
 from load_data import MultiTrackedUltrasoundDataset, TrackedUltrasoundDataset
-from ultrasound_losses import content_weight_map, ultrasound_confidence_map, ultrasound_edge_loss, ultrasound_edge_map
+from ultrasound_losses import ultrasound_confidence_map, ultrasound_edge_loss, ultrasound_edge_map
 from ultrasound_projection import (
     DEFAULT_IMAGE_PLANE_ORIGIN_PX,
     DEFAULT_IMAGE_T_PROBE,
@@ -34,6 +34,7 @@ class VanillaGaussianSplatting(nn.Module):
         scene_scale=1.0,
         initial_scale=1.0,
         initial_opacity=0.5,
+        initial_transmittance=0.99,
         initial_means=None,
         initial_colors=None,
     ):
@@ -53,11 +54,23 @@ class VanillaGaussianSplatting(nn.Module):
         if initial_scale.shape != (3,):
             raise ValueError("initial_scale must be a scalar or a 3-value sequence")
         self.log_scales = nn.Parameter(initial_scale.clamp_min(1e-6).log().repeat(num_gaussians, 1))
+        self.raw_cholesky = nn.Parameter(
+            self._initial_raw_cholesky(initial_scale.clamp_min(1e-6), num_gaussians)
+        )
         initial_opacity = float(initial_opacity)
         if initial_opacity <= 0.0 or initial_opacity >= 1.0:
             raise ValueError("initial_opacity must be between 0 and 1")
         opacity_logit = torch.logit(torch.as_tensor(initial_opacity, dtype=torch.float32))
         self.logit_opacities = nn.Parameter(opacity_logit.repeat(num_gaussians, 1))
+        initial_transmittance = float(initial_transmittance)
+        if initial_transmittance <= 0.0 or initial_transmittance >= 1.0:
+            raise ValueError("initial_transmittance must be between 0 and 1")
+        transmittance_logit = torch.logit(
+            torch.as_tensor(initial_transmittance, dtype=torch.float32)
+        )
+        self.logit_transmittances = nn.Parameter(
+            transmittance_logit.repeat(num_gaussians, 1)
+        )
 
         if initial_colors is None:
             colors = torch.rand(num_gaussians, channels)
@@ -104,6 +117,9 @@ class VanillaGaussianSplatting(nn.Module):
         disk_normals = None
         if primitive_mode == "disk":
             disk_normals = F.normalize(self.disk_normals, dim=-1, eps=1e-8)
+        covariances = None
+        if covariance_mode == "full_cholesky":
+            covariances = self.full_covariances(min_scale_mm=min_scale_mm, max_scale_mm=max_scale_mm)
 
         image, _ = render_ultrasound_gaussians(
             self.means,
@@ -113,6 +129,7 @@ class VanillaGaussianSplatting(nn.Module):
             slice_to_world,
             height,
             width,
+            transmittances=self.logit_transmittances,
             pixel_spacing=pixel_spacing,
             slice_thickness=slice_thickness,
             shadowing=shadowing,
@@ -133,14 +150,57 @@ class VanillaGaussianSplatting(nn.Module):
             attenuation_weight=F.softplus(self.acoustic_attenuation),
             reflection_weight=F.softplus(self.acoustic_reflection),
             scattering_weight=F.softplus(self.acoustic_scattering),
+            covariances=covariances,
         )
         return image
 
-    def scale_prior_loss(self, prior_scales, min_scale_mm=0.05, max_scale_mm=10.0):
+    @staticmethod
+    def _inverse_softplus(value):
+        value = torch.as_tensor(value, dtype=torch.float32).clamp_min(1e-6)
+        return value + torch.log(-torch.expm1(-value))
+
+    @classmethod
+    def _initial_raw_cholesky(cls, initial_scale, num_gaussians):
+        raw = torch.zeros((num_gaussians, 6), dtype=torch.float32)
+        raw_diag = cls._inverse_softplus(initial_scale)
+        raw[:, 0] = raw_diag[0]
+        raw[:, 2] = raw_diag[1]
+        raw[:, 5] = raw_diag[2]
+        return raw
+
+    def cholesky_factors(self, min_scale_mm=0.05, max_scale_mm=10.0):
+        raw = self.raw_cholesky
+        diag = F.softplus(raw[:, [0, 2, 5]]).clamp(min_scale_mm, max_scale_mm)
+        offdiag = raw[:, [1, 3, 4]].clamp(-max_scale_mm, max_scale_mm)
+        factors = raw.new_zeros((len(raw), 3, 3))
+        factors[:, 0, 0] = diag[:, 0]
+        factors[:, 1, 0] = offdiag[:, 0]
+        factors[:, 1, 1] = diag[:, 1]
+        factors[:, 2, 0] = offdiag[:, 1]
+        factors[:, 2, 1] = offdiag[:, 2]
+        factors[:, 2, 2] = diag[:, 2]
+        return factors
+
+    def full_covariances(self, min_scale_mm=0.05, max_scale_mm=10.0, epsilon=1e-6):
+        factors = self.cholesky_factors(min_scale_mm=min_scale_mm, max_scale_mm=max_scale_mm)
+        eye = torch.eye(3, device=factors.device, dtype=factors.dtype).unsqueeze(0)
+        return factors @ factors.transpose(-1, -2) + epsilon * eye
+
+    def effective_scales(self, covariance_mode="ultrasound_psf", min_scale_mm=0.05, max_scale_mm=10.0):
+        if covariance_mode == "full_cholesky":
+            covariances = self.full_covariances(min_scale_mm=min_scale_mm, max_scale_mm=max_scale_mm)
+            return covariances.diagonal(dim1=-2, dim2=-1).sqrt().clamp(min_scale_mm, max_scale_mm)
+        return torch.exp(self.log_scales).clamp(min_scale_mm, max_scale_mm)
+
+    def scale_prior_loss(self, prior_scales, min_scale_mm=0.05, max_scale_mm=10.0, covariance_mode="ultrasound_psf"):
         prior = torch.as_tensor(prior_scales, device=self.log_scales.device, dtype=self.log_scales.dtype)
         if prior.shape != (3,):
             raise ValueError("prior_scales must contain [lateral, axial, elevational] values")
-        scales = torch.exp(self.log_scales).clamp(min_scale_mm, max_scale_mm)
+        scales = self.effective_scales(
+            covariance_mode=covariance_mode,
+            min_scale_mm=min_scale_mm,
+            max_scale_mm=max_scale_mm,
+        )
         log_prior = prior.clamp_min(min_scale_mm).log()
         return F.mse_loss(scales.log(), log_prior.expand_as(scales.log()))
 
@@ -156,8 +216,22 @@ class VanillaGaussianSplatting(nn.Module):
             torch.log(torch.as_tensor(min_scale_mm, device=self.log_scales.device)),
             torch.log(torch.as_tensor(max_scale_mm, device=self.log_scales.device)),
         )
+        self.raw_cholesky.nan_to_num_(nan=0.0, posinf=max_scale_mm, neginf=-max_scale_mm)
+        self.raw_cholesky[:, [1, 3, 4]].clamp_(-max_scale_mm, max_scale_mm)
+        raw_min = self._inverse_softplus(torch.as_tensor(min_scale_mm, device=self.raw_cholesky.device))
+        raw_max = self._inverse_softplus(torch.as_tensor(max_scale_mm, device=self.raw_cholesky.device))
+        self.raw_cholesky[:, [0, 2, 5]].clamp_(raw_min, raw_max)
         self.logit_opacities.nan_to_num_(nan=0.0, posinf=10.0, neginf=-10.0)
         self.logit_opacities.clamp_(-10.0, 10.0)
+        if not hasattr(self, "logit_transmittances"):
+            transmittance_logit = torch.logit(
+                torch.tensor(0.99, device=self.logit_opacities.device)
+            )
+            self.logit_transmittances = nn.Parameter(
+                torch.full_like(self.logit_opacities, transmittance_logit)
+            )
+        self.logit_transmittances.nan_to_num_(nan=0.0, posinf=10.0, neginf=-10.0)
+        self.logit_transmittances.clamp_(-10.0, 10.0)
         self.colors.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
         self.colors.clamp_(0.0, 1.0)
         self.disk_normals.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
@@ -176,6 +250,7 @@ class VanillaGaussianSplatting(nn.Module):
         max_gaussians=10000,
         min_gaussians=100,
         max_new_gaussians=512,
+        covariance_mode="ultrasound_psf",
     ):
         """
         Adapt the number of Gaussians during training.
@@ -195,7 +270,9 @@ class VanillaGaussianSplatting(nn.Module):
 
         means = self.means.data[keep]
         log_scales = self.log_scales.data[keep]
+        raw_cholesky = self.raw_cholesky.data[keep]
         logit_opacities = self.logit_opacities.data[keep]
+        logit_transmittances = self.logit_transmittances.data[keep]
         colors = self.colors.data[keep]
         disk_normals = self.disk_normals.data[keep]
 
@@ -204,7 +281,11 @@ class VanillaGaussianSplatting(nn.Module):
             split_mask = torch.zeros(len(means), device=device, dtype=torch.bool)
         else:
             grad_norm = grad.detach().norm(dim=-1)[keep]
-            scales = torch.exp(log_scales)
+            if covariance_mode == "full_cholesky":
+                kept_covariances = self.full_covariances()[keep]
+                scales = kept_covariances.diagonal(dim1=-2, dim2=-1).sqrt()
+            else:
+                scales = torch.exp(log_scales)
             large = scales.max(dim=-1).values >= large_scale_threshold
             split_mask = (grad_norm >= grad_threshold) & large
 
@@ -214,32 +295,50 @@ class VanillaGaussianSplatting(nn.Module):
             split_indices = split_indices[: min(len(split_indices), remaining_capacity, max_new_gaussians)]
             parent_means = means[split_indices]
             parent_log_scales = log_scales[split_indices]
-            parent_scales = torch.exp(parent_log_scales)
+            parent_raw_cholesky = raw_cholesky[split_indices]
+            if covariance_mode == "full_cholesky":
+                parent_scales = scales[split_indices]
+            else:
+                parent_scales = torch.exp(parent_log_scales)
             offsets = torch.randn_like(parent_means) * parent_scales * 0.25
 
             child_means = parent_means + offsets
             child_log_scales = parent_log_scales + torch.log(
                 torch.as_tensor(split_factor, device=device, dtype=parent_log_scales.dtype)
             )
+            child_raw_cholesky = parent_raw_cholesky.clone()
+            child_raw_cholesky[:, [0, 2, 5]] = child_raw_cholesky[:, [0, 2, 5]] + torch.log(
+                torch.as_tensor(split_factor, device=device, dtype=parent_raw_cholesky.dtype)
+            )
+            child_raw_cholesky[:, [1, 3, 4]] = child_raw_cholesky[:, [1, 3, 4]] * split_factor
             child_logit_opacities = logit_opacities[split_indices] - torch.log(
                 torch.as_tensor(2.0, device=device, dtype=logit_opacities.dtype)
             )
+            child_logit_transmittances = logit_transmittances[split_indices]
             child_colors = colors[split_indices]
             child_disk_normals = disk_normals[split_indices]
 
             means[split_indices] = parent_means - offsets
             log_scales[split_indices] = child_log_scales
+            raw_cholesky[split_indices] = child_raw_cholesky
             logit_opacities[split_indices] = child_logit_opacities
+            logit_transmittances[split_indices] = child_logit_transmittances
 
             means = torch.cat([means, child_means], dim=0)
             log_scales = torch.cat([log_scales, child_log_scales], dim=0)
+            raw_cholesky = torch.cat([raw_cholesky, child_raw_cholesky], dim=0)
             logit_opacities = torch.cat([logit_opacities, child_logit_opacities], dim=0)
+            logit_transmittances = torch.cat(
+                [logit_transmittances, child_logit_transmittances], dim=0
+            )
             colors = torch.cat([colors, child_colors], dim=0)
             disk_normals = torch.cat([disk_normals, child_disk_normals], dim=0)
 
         self.means = nn.Parameter(means.contiguous())
         self.log_scales = nn.Parameter(log_scales.contiguous())
+        self.raw_cholesky = nn.Parameter(raw_cholesky.contiguous())
         self.logit_opacities = nn.Parameter(logit_opacities.contiguous())
+        self.logit_transmittances = nn.Parameter(logit_transmittances.contiguous())
         self.colors = nn.Parameter(colors.contiguous())
         self.disk_normals = nn.Parameter(disk_normals.contiguous())
 
@@ -253,6 +352,97 @@ class VanillaGaussianSplatting(nn.Module):
     @property
     def num_gaussians(self):
         return int(self.means.shape[0])
+
+
+class SourcePoseCorrection(nn.Module):
+    def __init__(
+        self,
+        source_count,
+        max_translation_mm=2.0,
+        max_rotation_deg=2.0,
+    ):
+        super().__init__()
+        self.max_translation_mm = float(max_translation_mm)
+        self.max_rotation_rad = float(max_rotation_deg) * np.pi / 180.0
+        self.raw_translation = nn.Parameter(torch.zeros(source_count, 3))
+        self.raw_rotation = nn.Parameter(torch.zeros(source_count, 3))
+
+    def correction_parameters(self, source_indices):
+        source_indices = source_indices.long().reshape(-1)
+        translation = self.max_translation_mm * torch.tanh(self.raw_translation[source_indices])
+        rotation = self.max_rotation_rad * torch.tanh(self.raw_rotation[source_indices])
+        return translation, rotation
+
+    def forward(self, poses, source_indices):
+        squeeze_output = poses.ndim == 2
+        if squeeze_output:
+            poses = poses.unsqueeze(0)
+        source_indices = source_indices.to(device=poses.device)
+        translation, rotation = self.correction_parameters(source_indices)
+        delta = se3_delta_to_matrix(rotation, translation, dtype=poses.dtype)
+        corrected = delta @ poses
+        return corrected.squeeze(0) if squeeze_output else corrected
+
+    def regularization_loss(self):
+        translation_fraction = torch.tanh(self.raw_translation).square().mean()
+        rotation_fraction = torch.tanh(self.raw_rotation).square().mean()
+        return translation_fraction + rotation_fraction
+
+    @torch.no_grad()
+    def metadata(self, source_names=None):
+        translation = self.max_translation_mm * torch.tanh(self.raw_translation.detach())
+        rotation = self.max_rotation_rad * torch.tanh(self.raw_rotation.detach())
+        rotation_deg = rotation * (180.0 / np.pi)
+        records = []
+        for index in range(len(translation)):
+            records.append(
+                {
+                    "source_index": int(index),
+                    "source_name": None if source_names is None else source_names[index],
+                    "translation_mm_xyz": [float(value) for value in translation[index].cpu()],
+                    "rotation_deg_xyz": [float(value) for value in rotation_deg[index].cpu()],
+                }
+            )
+        return records
+
+
+def skew_symmetric(vectors):
+    zero = torch.zeros_like(vectors[..., 0])
+    x = vectors[..., 0]
+    y = vectors[..., 1]
+    z = vectors[..., 2]
+    return torch.stack(
+        [
+            torch.stack([zero, -z, y], dim=-1),
+            torch.stack([z, zero, -x], dim=-1),
+            torch.stack([-y, x, zero], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def se3_delta_to_matrix(rotation_vectors, translations, dtype):
+    rotation_vectors = rotation_vectors.to(dtype=dtype)
+    translations = translations.to(dtype=dtype)
+    angles = torch.linalg.norm(rotation_vectors, dim=-1, keepdim=True)
+    axes = rotation_vectors / angles.clamp_min(1e-8)
+    skew = skew_symmetric(axes)
+    eye = torch.eye(3, device=rotation_vectors.device, dtype=dtype).expand(
+        rotation_vectors.shape[0], 3, 3
+    )
+    sin = torch.sin(angles)[..., None]
+    cos = torch.cos(angles)[..., None]
+    rotation = eye + sin * skew + (1.0 - cos) * (skew @ skew)
+    small = angles.squeeze(-1) < 1e-8
+    if small.any():
+        rotation = torch.where(small[:, None, None], eye, rotation)
+
+    delta = torch.eye(4, device=rotation_vectors.device, dtype=dtype).expand(
+        rotation_vectors.shape[0], 4, 4
+    ).clone()
+    delta[:, :3, :3] = rotation
+    delta[:, :3, 3] = translations
+    return delta
 
 
 def normalize_image_for_save(image):
@@ -356,6 +546,8 @@ def save_checkpoint(
     final_loss=None,
     calibration_metadata=None,
     validation_history=None,
+    pose_corrector=None,
+    source_names=None,
 ):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +555,9 @@ def save_checkpoint(
     checkpoint = {
         "step": int(step),
         "model_state_dict": model.state_dict(),
+        "pose_correction_state_dict": (
+            None if pose_corrector is None else pose_corrector.state_dict()
+        ),
         "num_gaussians": model.num_gaussians,
         "channels": int(model.colors.shape[-1]),
         "final_loss": None if final_loss is None else float(final_loss),
@@ -373,12 +568,21 @@ def save_checkpoint(
             "pixel_to_mm": args.pixel_to_mm,
             "image_scale": args.image_scale,
         },
+        "pose_correction": {
+            "mode": args.pose_correction,
+            "max_translation_mm": args.pose_correction_max_translation_mm,
+            "max_rotation_deg": args.pose_correction_max_rotation_deg,
+            "weight": args.pose_correction_weight,
+            "lr": args.pose_correction_lr,
+            "sources": [] if pose_corrector is None else pose_corrector.metadata(source_names),
+        },
         "covariance": {
             "primitive_mode": args.primitive_mode,
             "mode": args.covariance_mode,
             "min_scale_mm": args.min_scale_mm,
             "max_scale_mm": args.max_scale_mm,
             "initial_opacity": args.initial_opacity,
+            "initial_transmittance": args.initial_transmittance,
             "scale_prior_lateral": args.scale_prior_lateral,
             "scale_prior_axial": args.scale_prior_axial,
             "scale_prior_elevational": args.scale_prior_elevational,
@@ -388,7 +592,7 @@ def save_checkpoint(
             "acoustic_rendering": args.acoustic_rendering,
         },
         "loss": {
-            "type": args.loss,
+            "type": "ultrasound_edges_ssim",
             "accumulation_steps": int(max(args.accumulation_steps, 1)),
             "validation_slices": int(max(args.validation_slices, 0)),
             "validation_fraction": float(args.validation_fraction),
@@ -400,10 +604,9 @@ def save_checkpoint(
             "edge_weight": args.edge_loss_weight,
             "intensity_weight": args.intensity_loss_weight,
             "sobel_weight": args.sobel_loss_weight,
-            "volume_raw_weight": args.volume_raw_weight,
-            "volume_edge_weight": args.volume_edge_weight,
-            "volume_background_weight": args.volume_background_weight,
-            "volume_background_threshold": args.volume_background_threshold,
+            "ultrasound_edges_weight": 1.0 - args.ssim_weight,
+            "ssim_weight": args.ssim_weight,
+            "ssim_window_size": args.ssim_window_size,
             "opacity_sparsity_weight": args.opacity_sparsity_weight,
             "filter_kernel_size": args.filter_kernel_size,
             "filter_sigma": args.filter_sigma,
@@ -438,7 +641,11 @@ def save_checkpoint(
 
     torch.save(checkpoint, output_path)
 
-    metadata = {key: value for key, value in checkpoint.items() if key != "model_state_dict"}
+    metadata = {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {"model_state_dict", "pose_correction_state_dict"}
+    }
     metadata_path = output_path.with_suffix(".json")
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return output_path, metadata_path
@@ -750,85 +957,95 @@ def render_prediction(
     )
 
 
+def batch_source_index(batch, device):
+    if "sequence_index" not in batch:
+        return torch.zeros(1, device=device, dtype=torch.long)
+    source_index = batch["sequence_index"]
+    if not torch.is_tensor(source_index):
+        source_index = torch.as_tensor(source_index)
+    return source_index.to(device=device, dtype=torch.long).reshape(-1)
+
+
+def maybe_correct_pose(pose, source_index, pose_corrector):
+    if pose_corrector is None:
+        return pose
+    return pose_corrector(pose, source_index)
+
+
+def _as_bchw(image):
+    if image.ndim == 2:
+        return image.unsqueeze(0).unsqueeze(0)
+    if image.ndim == 3:
+        return image.unsqueeze(0)
+    if image.ndim == 4:
+        return image
+    raise ValueError(f"Expected image tensor with 2, 3, or 4 dims, got {image.ndim}")
+
+
+def ssim_loss(pred, target, window_size=11, data_range=1.0):
+    pred = _as_bchw(pred).clamp(0.0, data_range)
+    target = _as_bchw(target).clamp(0.0, data_range)
+    if pred.shape != target.shape:
+        raise ValueError(f"SSIM expects matching pred/target shapes, got {pred.shape} and {target.shape}")
+
+    window_size = int(window_size)
+    if window_size < 3:
+        raise ValueError("--ssim-window-size must be at least 3")
+    if window_size % 2 == 0:
+        window_size += 1
+
+    padding = window_size // 2
+    mu_pred = F.avg_pool2d(pred, window_size, stride=1, padding=padding)
+    mu_target = F.avg_pool2d(target, window_size, stride=1, padding=padding)
+    mu_pred_sq = mu_pred.square()
+    mu_target_sq = mu_target.square()
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred = F.avg_pool2d(pred * pred, window_size, stride=1, padding=padding) - mu_pred_sq
+    sigma_target = F.avg_pool2d(target * target, window_size, stride=1, padding=padding) - mu_target_sq
+    sigma_pred_target = F.avg_pool2d(pred * target, window_size, stride=1, padding=padding) - mu_pred_target
+
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    numerator = (2.0 * mu_pred_target + c1) * (2.0 * sigma_pred_target + c2)
+    denominator = (mu_pred_sq + mu_target_sq + c1) * (sigma_pred + sigma_target + c2)
+    ssim = numerator / denominator.clamp_min(1e-8)
+    return 1.0 - ssim.clamp(-1.0, 1.0).mean()
+
+
 def prediction_loss(pred, target, args, model=None):
-    if args.loss == "ultrasound_edges":
-        loss = ultrasound_edge_loss(
-            pred,
-            target,
-            laplacian_weight=args.laplacian_loss_weight,
-            edge_weight=args.edge_loss_weight,
-            intensity_weight=args.intensity_loss_weight,
-            sobel_weight=args.sobel_loss_weight,
-            sigmas=(args.filter_sigma,),
-            kernel_size=args.filter_kernel_size,
-            sobel_blur_kernel_size=args.filter_kernel_size,
-            sobel_blur_sigma=args.filter_sigma,
-            use_confidence=args.use_confidence,
-            background_threshold=args.confidence_background_threshold,
-            background_weight=args.confidence_background_weight,
-            dark_threshold=args.confidence_dark_threshold,
-            shadow_weight=args.confidence_shadow_weight,
-            bright_threshold=args.confidence_bright_threshold,
-            shadow_start_offset=args.confidence_shadow_start_offset,
-            enable_shadow_confidence=args.shadow_confidence,
-            content_normalize=args.content_normalize,
-            content_intensity_threshold=args.content_intensity_threshold,
-            content_feature_threshold=args.content_feature_threshold,
-            content_background_weight=args.content_background_weight,
-        )
-    elif args.loss == "volume_l1":
-        pred_bchw = pred.unsqueeze(0) if pred.ndim == 3 else pred
-        target_bchw = target.unsqueeze(0) if target.ndim == 3 else target
-        loss = F.l1_loss(pred_bchw, target_bchw) * args.volume_raw_weight
-
-        if args.volume_edge_weight > 0.0:
-            edge_loss = ultrasound_edge_loss(
-                pred,
-                target,
-                laplacian_weight=args.laplacian_loss_weight,
-                edge_weight=args.edge_loss_weight,
-                intensity_weight=0.0,
-                sobel_weight=args.sobel_loss_weight,
-                sigmas=(args.filter_sigma,),
-                kernel_size=args.filter_kernel_size,
-                sobel_blur_kernel_size=args.filter_kernel_size,
-                sobel_blur_sigma=args.filter_sigma,
-                use_confidence=args.use_confidence,
-                background_threshold=args.confidence_background_threshold,
-                background_weight=args.confidence_background_weight,
-                dark_threshold=args.confidence_dark_threshold,
-                shadow_weight=args.confidence_shadow_weight,
-                bright_threshold=args.confidence_bright_threshold,
-                shadow_start_offset=args.confidence_shadow_start_offset,
-                enable_shadow_confidence=args.shadow_confidence,
-                content_normalize=args.content_normalize,
-                content_intensity_threshold=args.content_intensity_threshold,
-                content_feature_threshold=args.content_feature_threshold,
-                content_background_weight=args.content_background_weight,
-            )
-            loss = loss + args.volume_edge_weight * edge_loss
-
-        if args.volume_background_weight > 0.0:
-            target_gray = target_bchw.mean(dim=1, keepdim=True)
-            pred_gray = pred_bchw.mean(dim=1, keepdim=True)
-            background = target_gray <= args.volume_background_threshold
-            if background.any():
-                loss = loss + args.volume_background_weight * pred_gray[background].mean()
-    else:
-        raw_weight = None
-        if args.content_normalize:
-            raw_weight = content_weight_map(
-                target,
-                intensity_threshold=args.content_intensity_threshold,
-                background_weight=args.content_background_weight,
-            )
-        if raw_weight is None:
-            loss = F.l1_loss(pred, target)
-        else:
-            raw_error = (pred - target).abs()
-            if raw_weight.shape[1] == 1 and raw_error.shape[1] != 1:
-                raw_weight = raw_weight.expand(-1, raw_error.shape[1], -1, -1)
-            loss = (raw_error * raw_weight).sum() / raw_weight.sum().clamp_min(1e-8)
+    edge_loss = ultrasound_edge_loss(
+        pred,
+        target,
+        laplacian_weight=args.laplacian_loss_weight,
+        edge_weight=args.edge_loss_weight,
+        intensity_weight=args.intensity_loss_weight,
+        sobel_weight=args.sobel_loss_weight,
+        sigmas=(args.filter_sigma,),
+        kernel_size=args.filter_kernel_size,
+        sobel_blur_kernel_size=args.filter_kernel_size,
+        sobel_blur_sigma=args.filter_sigma,
+        use_confidence=args.use_confidence,
+        background_threshold=args.confidence_background_threshold,
+        background_weight=args.confidence_background_weight,
+        dark_threshold=args.confidence_dark_threshold,
+        shadow_weight=args.confidence_shadow_weight,
+        bright_threshold=args.confidence_bright_threshold,
+        shadow_start_offset=args.confidence_shadow_start_offset,
+        enable_shadow_confidence=args.shadow_confidence,
+        content_normalize=args.content_normalize,
+        content_intensity_threshold=args.content_intensity_threshold,
+        content_feature_threshold=args.content_feature_threshold,
+        content_background_weight=args.content_background_weight,
+    )
+    structure_loss = ssim_loss(
+        pred,
+        target,
+        window_size=args.ssim_window_size,
+        data_range=1.0,
+    )
+    ssim_weight = min(max(float(args.ssim_weight), 0.0), 1.0)
+    loss = (1.0 - ssim_weight) * edge_loss + ssim_weight * structure_loss
 
     if model is not None and args.scale_prior_weight > 0.0:
         loss = loss + args.scale_prior_weight * model.scale_prior_loss(
@@ -839,6 +1056,7 @@ def prediction_loss(pred, target, args, model=None):
             ),
             min_scale_mm=args.min_scale_mm,
             max_scale_mm=args.max_scale_mm,
+            covariance_mode=args.covariance_mode,
         )
     if model is not None and args.opacity_sparsity_weight > 0.0:
         loss = loss + args.opacity_sparsity_weight * model.opacity_sparsity_loss()
@@ -848,6 +1066,7 @@ def prediction_loss(pred, target, args, model=None):
 @torch.no_grad()
 def evaluate_validation_loss(
     model,
+    pose_corrector,
     validation_loader,
     args,
     device,
@@ -862,11 +1081,16 @@ def evaluate_validation_loss(
         return None
 
     was_training = model.training
+    correction_was_training = False if pose_corrector is None else pose_corrector.training
     model.eval()
+    if pose_corrector is not None:
+        pose_corrector.eval()
     losses = []
     for batch in validation_loader:
         target = batch["image"].squeeze(0).to(device)
         pose = batch["pose"].squeeze(0).to(device)
+        source_index = batch_source_index(batch, device)
+        pose = maybe_correct_pose(pose, source_index, pose_corrector)
         with torch.cuda.amp.autocast(enabled=use_amp):
             pred = render_prediction(
                 model,
@@ -883,6 +1107,8 @@ def evaluate_validation_loss(
 
     if was_training:
         model.train()
+    if pose_corrector is not None and correction_was_training:
+        pose_corrector.train()
     return sum(losses) / max(len(losses), 1)
 
 
@@ -906,6 +1132,7 @@ def train(args):
             grayscale=args.grayscale,
             low_intensity_threshold=args.low_intensity_threshold,
         )
+        source_names = [dataset.source_name]
     else:
         dataset = MultiTrackedUltrasoundDataset(
             image_dirs=image_dirs,
@@ -914,6 +1141,7 @@ def train(args):
             grayscale=args.grayscale,
             low_intensity_threshold=args.low_intensity_threshold,
         )
+        source_names = [source_dataset.source_name for source_dataset in dataset.datasets]
     source_validation = choose_source_validation_indices(dataset, args.validation_sources)
     validation_source_names = []
     if source_validation is None:
@@ -983,10 +1211,30 @@ def train(args):
         channels=channels,
         initial_scale=(args.initial_scale_x, args.initial_scale_y, args.initial_scale_z),
         initial_opacity=args.initial_opacity,
+        initial_transmittance=args.initial_transmittance,
         initial_means=initial_means,
         initial_colors=initial_colors,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    pose_corrector = None
+    if args.pose_correction == "source":
+        pose_corrector = SourcePoseCorrection(
+            len(source_names),
+            max_translation_mm=args.pose_correction_max_translation_mm,
+            max_rotation_deg=args.pose_correction_max_rotation_deg,
+        ).to(device)
+        print(
+            "enabled source pose correction: "
+            f"{len(source_names)} sources, "
+            f"translation <= {args.pose_correction_max_translation_mm} mm, "
+            f"rotation <= {args.pose_correction_max_rotation_deg} deg"
+        )
+
+    optimizer_parameters = [{"params": model.parameters(), "lr": args.lr}]
+    if pose_corrector is not None:
+        optimizer_parameters.append(
+            {"params": pose_corrector.parameters(), "lr": args.pose_correction_lr}
+        )
+    optimizer = torch.optim.Adam(optimizer_parameters)
     accumulation_steps = max(int(args.accumulation_steps), 1)
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -1002,6 +1250,8 @@ def train(args):
         for accumulation_index, batch in zip(range(accumulation_steps), loader):
             target = batch["image"].squeeze(0).to(device)
             pose = batch["pose"].squeeze(0).to(device)
+            source_index = batch_source_index(batch, device)
+            pose = maybe_correct_pose(pose, source_index, pose_corrector)
             model.stabilize_parameters(
                 min_scale_mm=args.min_scale_mm,
                 max_scale_mm=args.max_scale_mm,
@@ -1019,6 +1269,11 @@ def train(args):
                     image_scale,
                 )
                 loss = prediction_loss(pred, target, args, model=model)
+                if pose_corrector is not None and args.pose_correction_weight > 0.0:
+                    loss = loss + (
+                        args.pose_correction_weight
+                        * pose_corrector.regularization_loss()
+                    )
 
             accumulated_loss += float(loss.detach().item())
             accumulated_count += 1
@@ -1031,9 +1286,10 @@ def train(args):
             raise RuntimeError("No training slices were available from the data loader.")
 
         scaler.unscale_(optimizer)
-        for parameter in model.parameters():
-            if parameter.grad is not None:
-                parameter.grad.div_(accumulated_count)
+        for parameter_group in optimizer.param_groups:
+            for parameter in parameter_group["params"]:
+                if parameter.grad is not None:
+                    parameter.grad.div_(accumulated_count)
 
         loss = torch.as_tensor(accumulated_loss / accumulated_count, device=device)
         scaler.step(optimizer)
@@ -1056,8 +1312,14 @@ def train(args):
                 max_gaussians=args.max_gaussians,
                 min_gaussians=args.min_gaussians,
                 max_new_gaussians=args.max_new_gaussians,
+                covariance_mode=args.covariance_mode,
             )
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+            optimizer_parameters = [{"params": model.parameters(), "lr": args.lr}]
+            if pose_corrector is not None:
+                optimizer_parameters.append(
+                    {"params": pose_corrector.parameters(), "lr": args.pose_correction_lr}
+                )
+            optimizer = torch.optim.Adam(optimizer_parameters)
             if args.log_densify:
                 print(
                     "densify/prune "
@@ -1102,6 +1364,7 @@ def train(args):
         ):
             validation_loss = evaluate_validation_loss(
                 model,
+                pose_corrector,
                 validation_loader,
                 args,
                 device,
@@ -1134,6 +1397,8 @@ def train(args):
                 final_loss=loss.item(),
                 validation_history=validation_history,
                 calibration_metadata=checkpoint_calibration_metadata,
+                pose_corrector=pose_corrector,
+                source_names=source_names,
             )
             print(f"saved step checkpoint {output_path}")
             print(f"saved step metadata {metadata_path}")
@@ -1147,6 +1412,8 @@ def train(args):
             final_loss=loss.item() if "loss" in locals() else None,
             validation_history=validation_history,
             calibration_metadata=checkpoint_calibration_metadata,
+            pose_corrector=pose_corrector,
+            source_names=source_names,
         )
         print(f"saved checkpoint {output_path}")
         print(f"saved metadata {metadata_path}")
@@ -1175,6 +1442,36 @@ def parse_args():
     parser.add_argument("--image-scale", type=float, default=None)
     parser.add_argument("--image-origin-x", type=float, default=None)
     parser.add_argument("--image-origin-y", type=float, default=None)
+    parser.add_argument(
+        "--pose-correction",
+        choices=("none", "source"),
+        default="none",
+        help="Learn small pose corrections. 'source' learns one rigid correction per image source.",
+    )
+    parser.add_argument(
+        "--pose-correction-max-translation-mm",
+        type=float,
+        default=2.0,
+        help="Maximum learned source-correction translation in millimeters per axis.",
+    )
+    parser.add_argument(
+        "--pose-correction-max-rotation-deg",
+        type=float,
+        default=2.0,
+        help="Maximum learned source-correction rotation in degrees per axis.",
+    )
+    parser.add_argument(
+        "--pose-correction-weight",
+        type=float,
+        default=0.01,
+        help="Regularization weight that discourages large pose corrections.",
+    )
+    parser.add_argument(
+        "--pose-correction-lr",
+        type=float,
+        default=5e-4,
+        help="Learning rate for pose-correction parameters.",
+    )
     parser.add_argument("--slice-thickness", type=float, default=1.0)
     parser.add_argument("--initial-scale-x", "--initial-scale-lateral", dest="initial_scale_x", type=float, default=1.0)
     parser.add_argument("--initial-scale-y", "--initial-scale-axial", dest="initial_scale_y", type=float, default=0.5)
@@ -1185,8 +1482,18 @@ def parse_args():
         default=0.5,
         help="Initial per-Gaussian opacity probability. Lower values reduce early blob saturation.",
     )
+    parser.add_argument(
+        "--initial-transmittance",
+        type=float,
+        default=0.99,
+        help="Initial per-Gaussian acoustic transmittance probability for learnable shadowing.",
+    )
     parser.add_argument("--primitive-mode", choices=("volume", "disk", "dot"), default="volume")
-    parser.add_argument("--covariance-mode", choices=("ultrasound_psf", "world_axis_aligned"), default="ultrasound_psf")
+    parser.add_argument(
+        "--covariance-mode",
+        choices=("ultrasound_psf", "world_axis_aligned", "full_cholesky"),
+        default="ultrasound_psf",
+    )
     parser.add_argument("--min-scale-mm", type=float, default=0.05)
     parser.add_argument("--max-scale-mm", type=float, default=10.0)
     parser.add_argument("--scale-prior-lateral", type=float, default=1.0)
@@ -1201,34 +1508,21 @@ def parse_args():
     parser.add_argument("--intensity-threshold", type=float, default=0.05)
     parser.add_argument("--shadowing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shadow-strength", type=float, default=1.0)
-    parser.add_argument("--loss", choices=("ultrasound_edges", "raw_l1", "volume_l1"), default="ultrasound_edges")
     parser.add_argument("--laplacian-loss-weight", type=float, default=1.0)
     parser.add_argument("--edge-loss-weight", type=float, default=1.0)
     parser.add_argument("--intensity-loss-weight", type=float, default=0.05)
     parser.add_argument("--sobel-loss-weight", type=float, default=1.5)
     parser.add_argument(
-        "--volume-raw-weight",
+        "--ssim-weight",
         type=float,
-        default=1.0,
-        help="Raw intensity L1 weight for --loss volume_l1.",
+        default=0.2,
+        help="Blend weight for SSIM loss. 0 uses only ultrasound edge loss, 1 uses only SSIM.",
     )
     parser.add_argument(
-        "--volume-edge-weight",
-        type=float,
-        default=0.25,
-        help="Auxiliary ultrasound edge/detail weight for --loss volume_l1.",
-    )
-    parser.add_argument(
-        "--volume-background-weight",
-        type=float,
-        default=0.5,
-        help="Penalty for predicted brightness where target pixels are dark in --loss volume_l1.",
-    )
-    parser.add_argument(
-        "--volume-background-threshold",
-        type=float,
-        default=0.03,
-        help="Target intensity threshold used by the volume background penalty.",
+        "--ssim-window-size",
+        type=int,
+        default=11,
+        help="Odd local window size for SSIM loss. Even values are rounded up internally.",
     )
     parser.add_argument(
         "--opacity-sparsity-weight",
@@ -1334,3 +1628,4 @@ def parse_args():
 
 if __name__ == "__main__":
     train(parse_args())
+
