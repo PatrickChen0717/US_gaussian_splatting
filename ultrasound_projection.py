@@ -183,6 +183,7 @@ def render_ultrasound_gaussians(
     reflection_weight=0.0,
     scattering_weight=0.0,
     covariances=None,
+    max_visible_gaussians_per_slice=None,
 ):
     """
     Render an ultrasound slice from 3D Gaussians.
@@ -240,6 +241,23 @@ def render_ultrasound_gaussians(
         local_transmittances = None
     else:
         local_transmittances = transmittances[visible].reshape(-1).sigmoid()
+
+    if (
+        max_visible_gaussians_per_slice is not None
+        and int(max_visible_gaussians_per_slice) > 0
+        and len(xys) > int(max_visible_gaussians_per_slice)
+    ):
+        keep_count = int(max_visible_gaussians_per_slice)
+        scores = opacities.detach()
+        keep = torch.topk(scores, keep_count, largest=True).indices
+        xys = xys[keep]
+        sigmas = sigmas[keep]
+        depths = depths[keep]
+        plane_weights = plane_weights[keep]
+        colors = colors[keep]
+        opacities = opacities[keep]
+        if local_transmittances is not None:
+            local_transmittances = local_transmittances[keep]
 
     yy, xx = torch.meshgrid(
         torch.arange(image_height, device=device, dtype=means.dtype),

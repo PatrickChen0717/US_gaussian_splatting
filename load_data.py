@@ -386,7 +386,16 @@ class TrackedUltrasoundDataset(Dataset):
         self.image_paths = None
         self.source_name = str(image_source)
 
-        if image_source.is_file() and is_mha_path(image_source):
+        if image_source.is_file() and image_source.suffix.lower() == ".npy":
+            self.frames = np.load(image_source)
+            if self.frames.ndim not in (3, 4):
+                raise ValueError(
+                    f"Expected .npy images with shape [N, H, W] or [N, H, W, C], "
+                    f"got {self.frames.shape}"
+                )
+            self.timestamps = None
+            self.poses = load_pose_file(poses_path, only_ok=only_ok_poses)
+        elif image_source.is_file() and is_mha_path(image_source):
             self.frames, mha_poses, self.timestamps = load_mha_sequence(
                 image_source,
                 only_ok=only_ok_poses,

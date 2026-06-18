@@ -19,6 +19,160 @@ from ultrasound_projection import (
 )
 
 
+TRAIN_CONFIG_DEFAULTS = {
+    "image_dir": [],
+    "poses": None,
+    "height": 128,
+    "width": 128,
+    "num_gaussians": 512,
+    "init": "random",
+    "init_jitter_voxels": 0.5,
+    "grid_depth": 64,
+    "grid_height": 64,
+    "grid_width": 64,
+    "pixel_spacing_x": 1.0,
+    "pixel_spacing_y": 1.0,
+    "pixel_to_mm": None,
+    "image_scale": None,
+    "image_origin_x": None,
+    "image_origin_y": None,
+    "pose_correction": "none",
+    "pose_correction_max_translation_mm": 2.0,
+    "pose_correction_max_rotation_deg": 2.0,
+    "pose_correction_weight": 0.01,
+    "pose_correction_lr": 5e-4,
+    "slice_thickness": 1.0,
+    "initial_scale_x": 1.0,
+    "initial_scale_y": 0.5,
+    "initial_scale_z": 2.0,
+    "initial_opacity": 0.5,
+    "initial_transmittance": 0.99,
+    "primitive_mode": "volume",
+    "covariance_mode": "ultrasound_psf",
+    "min_scale_mm": 0.05,
+    "max_scale_mm": 10.0,
+    "scale_prior_lateral": 1.0,
+    "scale_prior_axial": 0.5,
+    "scale_prior_elevational": 2.0,
+    "scale_prior_weight": 1e-3,
+    "lateral_depth_slope": 0.0,
+    "elevational_depth_slope": 0.0,
+    "acoustic_rendering": False,
+    "render_chunk_size": 128,
+    "pixel_stride": 2,
+    "intensity_threshold": 0.05,
+    "shadowing": True,
+    "shadow_strength": 1.0,
+    "max_visible_gaussians_per_slice": None,
+    "laplacian_loss_weight": 1.0,
+    "edge_loss_weight": 1.0,
+    "intensity_loss_weight": 0.05,
+    "sobel_loss_weight": 1.5,
+    "ssim_weight": 0.2,
+    "ssim_window_size": 11,
+    "opacity_sparsity_weight": 0.0,
+    "filter_kernel_size": 9,
+    "filter_sigma": 1.0,
+    "low_intensity_threshold": None,
+    "content_normalize": True,
+    "content_intensity_threshold": 0.03,
+    "content_feature_threshold": 0.05,
+    "content_background_weight": 0.05,
+    "use_confidence": False,
+    "confidence_background_threshold": 0.02,
+    "confidence_background_weight": 0.0,
+    "confidence_dark_threshold": 0.08,
+    "confidence_shadow_weight": 0.2,
+    "confidence_bright_threshold": 0.65,
+    "confidence_shadow_start_offset": 8,
+    "shadow_confidence": True,
+    "steps": 500,
+    "accumulation_steps": 1,
+    "validation_slices": 0,
+    "validation_fraction": 0.0,
+    "validation_sources": None,
+    "validation_every": 100,
+    "validation_seed": 1234,
+    "lr": 1e-2,
+    "log_every": 25,
+    "densify_every": 0,
+    "densify_start": 100,
+    "densify_grad_threshold": 1e-4,
+    "prune_opacity_threshold": 0.02,
+    "split_scale_threshold": 2.0,
+    "split_scale_factor": 0.7,
+    "max_gaussians": 10000,
+    "min_gaussians": 100,
+    "max_new_gaussians": 512,
+    "log_densify": True,
+    "debug_every": 0,
+    "debug_dir": "outputs/debug_visuals",
+    "device": "cuda",
+    "amp": False,
+    "grayscale": False,
+    "output": "outputs/checkpoints/vanilla_gaussians.pt",
+    "checkpoint_every": 0,
+}
+
+
+def load_train_config(config_path):
+    config_path = Path(config_path).expanduser().resolve()
+    loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{config_path} must contain a JSON object")
+
+    unknown_keys = sorted(set(loaded) - set(TRAIN_CONFIG_DEFAULTS))
+    if unknown_keys:
+        raise ValueError(
+            f"{config_path} contains unknown config keys: {', '.join(unknown_keys)}"
+        )
+
+    config = dict(TRAIN_CONFIG_DEFAULTS)
+    config.update(loaded)
+    if not config["image_dir"]:
+        raise ValueError(f"{config_path} must set image_dir to one or more inputs")
+    if isinstance(config["image_dir"], str):
+        config["image_dir"] = [config["image_dir"]]
+    if config["poses"] is not None and isinstance(config["poses"], str):
+        config["poses"] = [config["poses"]]
+    if config["validation_sources"] is not None and isinstance(config["validation_sources"], str):
+        config["validation_sources"] = [config["validation_sources"]]
+
+    def resolve_path(value):
+        if value is None:
+            return None
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return str(path)
+        return str((config_path.parent / path).resolve())
+
+    config["image_dir"] = [resolve_path(path) for path in config["image_dir"]]
+    if config["poses"] is not None:
+        config["poses"] = [resolve_path(path) for path in config["poses"]]
+    if config["output"]:
+        config["output"] = resolve_path(config["output"])
+    if config["debug_dir"]:
+        config["debug_dir"] = resolve_path(config["debug_dir"])
+
+    config["config_path"] = str(config_path)
+    config["loss_config_path"] = str(config_path)
+    if config["init"] not in {"random", "svrtk"}:
+        raise ValueError("config init must be either 'random' or 'svrtk'")
+    if config["covariance_mode"] not in {"ultrasound_psf", "world_axis_aligned", "full_cholesky"}:
+        raise ValueError(
+            "config covariance_mode must be 'ultrasound_psf', "
+            "'world_axis_aligned', or 'full_cholesky'"
+        )
+    ssim_weight = min(max(float(config["ssim_weight"]), 0.0), 1.0)
+    ssim_window_size = int(config["ssim_window_size"])
+    if ssim_window_size < 3:
+        raise ValueError("config ssim_window_size must be at least 3")
+
+    config["ssim_weight"] = ssim_weight
+    config["ssim_window_size"] = ssim_window_size
+    return argparse.Namespace(**config)
+
+
 class VanillaGaussianSplatting(nn.Module):
     """
     Minimal differentiable ultrasound Gaussian splatting in plain PyTorch.
@@ -111,6 +265,7 @@ class VanillaGaussianSplatting(nn.Module):
         lateral_depth_slope=0.0,
         elevational_depth_slope=0.0,
         render_chunk_size=256,
+        max_visible_gaussians_per_slice=None,
         primitive_mode="volume",
         acoustic_rendering=False,
     ):
@@ -144,6 +299,7 @@ class VanillaGaussianSplatting(nn.Module):
             lateral_depth_slope=lateral_depth_slope,
             elevational_depth_slope=elevational_depth_slope,
             render_chunk_size=render_chunk_size,
+            max_visible_gaussians_per_slice=max_visible_gaussians_per_slice,
             primitive_mode=primitive_mode,
             disk_normals=disk_normals,
             acoustic_rendering=acoustic_rendering,
@@ -538,6 +694,68 @@ def args_to_metadata(args):
     return metadata
 
 
+def colors_to_rgb_uint8(colors):
+    colors = colors.detach().float().cpu().clamp(0.0, 1.0).numpy()
+    if colors.shape[1] == 1:
+        colors = np.repeat(colors, 3, axis=1)
+    return np.clip(colors[:, :3] * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def write_gaussians_ply(model, output_path, opacity_threshold=0.0):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        means = model.means.detach().float().cpu().numpy()
+        scales = model.effective_scales().detach().float().cpu().numpy()
+        colors = colors_to_rgb_uint8(model.colors)
+        opacities = torch.sigmoid(model.logit_opacities).detach().float().cpu().numpy().reshape(-1)
+        if hasattr(model, "disk_normals"):
+            normals = F.normalize(model.disk_normals.detach().float(), dim=-1, eps=1e-8).cpu().numpy()
+        else:
+            normals = np.zeros_like(means)
+            normals[:, 2] = 1.0
+
+    keep = opacities >= opacity_threshold
+    means = means[keep]
+    scales = scales[keep]
+    colors = colors[keep]
+    opacities = opacities[keep]
+    normals = normals[keep]
+
+    header = [
+        "ply",
+        "format ascii 1.0",
+        "comment exported from ultrasound Gaussian splatting training",
+        f"element vertex {len(means)}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property uchar red",
+        "property uchar green",
+        "property uchar blue",
+        "property float opacity",
+        "property float scale_x",
+        "property float scale_y",
+        "property float scale_z",
+        "property float normal_x",
+        "property float normal_y",
+        "property float normal_z",
+        "end_header",
+    ]
+
+    with output_path.open("w", encoding="utf-8") as file:
+        file.write("\n".join(header) + "\n")
+        for i in range(len(means)):
+            file.write(
+                f"{means[i, 0]:.8f} {means[i, 1]:.8f} {means[i, 2]:.8f} "
+                f"{int(colors[i, 0])} {int(colors[i, 1])} {int(colors[i, 2])} "
+                f"{opacities[i]:.8f} "
+                f"{scales[i, 0]:.8f} {scales[i, 1]:.8f} {scales[i, 2]:.8f} "
+                f"{normals[i, 0]:.8f} {normals[i, 1]:.8f} {normals[i, 2]:.8f}\n"
+            )
+
+
 def save_checkpoint(
     model,
     output_path,
@@ -600,6 +818,7 @@ def save_checkpoint(
             "validation_every": int(max(args.validation_every, 0)),
             "validation_seed": int(args.validation_seed),
             "amp": bool(args.amp),
+            "config_path": args.loss_config_path,
             "laplacian_weight": args.laplacian_loss_weight,
             "edge_weight": args.edge_loss_weight,
             "intensity_weight": args.intensity_loss_weight,
@@ -640,15 +859,18 @@ def save_checkpoint(
     }
 
     torch.save(checkpoint, output_path)
+    ply_path = output_path.with_suffix(".ply")
+    write_gaussians_ply(model, ply_path)
 
     metadata = {
         key: value
         for key, value in checkpoint.items()
         if key not in {"model_state_dict", "pose_correction_state_dict"}
     }
+    metadata["ply_path"] = str(ply_path)
     metadata_path = output_path.with_suffix(".json")
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return output_path, metadata_path
+    return output_path, metadata_path, ply_path
 
 
 def checkpoint_path_for_step(output_path, step):
@@ -952,6 +1174,7 @@ def render_prediction(
         lateral_depth_slope=args.lateral_depth_slope,
         elevational_depth_slope=args.elevational_depth_slope,
         render_chunk_size=args.render_chunk_size,
+        max_visible_gaussians_per_slice=args.max_visible_gaussians_per_slice,
         primitive_mode=args.primitive_mode,
         acoustic_rendering=args.acoustic_rendering,
     )
@@ -985,12 +1208,17 @@ def _as_bchw(image):
 def ssim_loss(pred, target, window_size=11, data_range=1.0):
     pred = _as_bchw(pred).clamp(0.0, data_range)
     target = _as_bchw(target).clamp(0.0, data_range)
+    if pred.shape[1] != target.shape[1]:
+        if pred.shape[1] == 1:
+            pred = pred.expand(-1, target.shape[1], -1, -1)
+        elif target.shape[1] == 1:
+            target = target.expand(-1, pred.shape[1], -1, -1)
     if pred.shape != target.shape:
         raise ValueError(f"SSIM expects matching pred/target shapes, got {pred.shape} and {target.shape}")
 
     window_size = int(window_size)
     if window_size < 3:
-        raise ValueError("--ssim-window-size must be at least 3")
+        raise ValueError("config ssim_window_size must be at least 3")
     if window_size % 2 == 0:
         window_size += 1
 
@@ -1389,7 +1617,7 @@ def train(args):
 
         if args.output and args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
             step_output = checkpoint_path_for_step(args.output, step)
-            output_path, metadata_path = save_checkpoint(
+            output_path, metadata_path, ply_path = save_checkpoint(
                 model,
                 step_output,
                 args,
@@ -1402,9 +1630,10 @@ def train(args):
             )
             print(f"saved step checkpoint {output_path}")
             print(f"saved step metadata {metadata_path}")
+            print(f"saved step ply {ply_path}")
 
     if args.output:
-        output_path, metadata_path = save_checkpoint(
+        output_path, metadata_path, ply_path = save_checkpoint(
             model,
             args.output,
             args,
@@ -1417,213 +1646,22 @@ def train(args):
         )
         print(f"saved checkpoint {output_path}")
         print(f"saved metadata {metadata_path}")
+        print(f"saved ply {ply_path}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a vanilla PyTorch Gaussian splatting model on images.")
-    parser.add_argument("--image-dir", required=True, nargs="+", help="One or more image folders or tracked .mha/.igs.mha sequences.")
-    parser.add_argument("--poses", nargs="*", default=None, help="Optional .npy/.csv pose file for each image source. Leave unset for .igs.mha embedded poses.")
-    parser.add_argument("--height", type=int, default=128)
-    parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--num-gaussians", type=int, default=512)
-    parser.add_argument("--init", choices=("random", "svrtk"), default="random")
-    parser.add_argument(
-        "--init-jitter-voxels",
-        type=float,
-        default=0.5,
-        help="Randomly jitter SVRTK-initialized Gaussian centers by this many grid voxels.",
-    )
-    parser.add_argument("--grid-depth", type=int, default=64)
-    parser.add_argument("--grid-height", type=int, default=64)
-    parser.add_argument("--grid-width", type=int, default=64)
-    parser.add_argument("--pixel-spacing-x", type=float, default=1.0)
-    parser.add_argument("--pixel-spacing-y", type=float, default=1.0)
-    parser.add_argument("--pixel-to-mm", type=float, default=None)
-    parser.add_argument("--image-scale", type=float, default=None)
-    parser.add_argument("--image-origin-x", type=float, default=None)
-    parser.add_argument("--image-origin-y", type=float, default=None)
-    parser.add_argument(
-        "--pose-correction",
-        choices=("none", "source"),
-        default="none",
-        help="Learn small pose corrections. 'source' learns one rigid correction per image source.",
-    )
-    parser.add_argument(
-        "--pose-correction-max-translation-mm",
-        type=float,
-        default=2.0,
-        help="Maximum learned source-correction translation in millimeters per axis.",
-    )
-    parser.add_argument(
-        "--pose-correction-max-rotation-deg",
-        type=float,
-        default=2.0,
-        help="Maximum learned source-correction rotation in degrees per axis.",
-    )
-    parser.add_argument(
-        "--pose-correction-weight",
-        type=float,
-        default=0.01,
-        help="Regularization weight that discourages large pose corrections.",
-    )
-    parser.add_argument(
-        "--pose-correction-lr",
-        type=float,
-        default=5e-4,
-        help="Learning rate for pose-correction parameters.",
-    )
-    parser.add_argument("--slice-thickness", type=float, default=1.0)
-    parser.add_argument("--initial-scale-x", "--initial-scale-lateral", dest="initial_scale_x", type=float, default=1.0)
-    parser.add_argument("--initial-scale-y", "--initial-scale-axial", dest="initial_scale_y", type=float, default=0.5)
-    parser.add_argument("--initial-scale-z", "--initial-scale-elevational", dest="initial_scale_z", type=float, default=2.0)
-    parser.add_argument(
-        "--initial-opacity",
-        type=float,
-        default=0.5,
-        help="Initial per-Gaussian opacity probability. Lower values reduce early blob saturation.",
-    )
-    parser.add_argument(
-        "--initial-transmittance",
-        type=float,
-        default=0.99,
-        help="Initial per-Gaussian acoustic transmittance probability for learnable shadowing.",
-    )
-    parser.add_argument("--primitive-mode", choices=("volume", "disk", "dot"), default="volume")
-    parser.add_argument(
-        "--covariance-mode",
-        choices=("ultrasound_psf", "world_axis_aligned", "full_cholesky"),
-        default="ultrasound_psf",
-    )
-    parser.add_argument("--min-scale-mm", type=float, default=0.05)
-    parser.add_argument("--max-scale-mm", type=float, default=10.0)
-    parser.add_argument("--scale-prior-lateral", type=float, default=1.0)
-    parser.add_argument("--scale-prior-axial", type=float, default=0.5)
-    parser.add_argument("--scale-prior-elevational", type=float, default=2.0)
-    parser.add_argument("--scale-prior-weight", type=float, default=1e-3)
-    parser.add_argument("--lateral-depth-slope", type=float, default=0.0)
-    parser.add_argument("--elevational-depth-slope", type=float, default=0.0)
-    parser.add_argument("--acoustic-rendering", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--render-chunk-size", type=int, default=128)
-    parser.add_argument("--pixel-stride", type=int, default=2)
-    parser.add_argument("--intensity-threshold", type=float, default=0.05)
-    parser.add_argument("--shadowing", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--shadow-strength", type=float, default=1.0)
-    parser.add_argument("--laplacian-loss-weight", type=float, default=1.0)
-    parser.add_argument("--edge-loss-weight", type=float, default=1.0)
-    parser.add_argument("--intensity-loss-weight", type=float, default=0.05)
-    parser.add_argument("--sobel-loss-weight", type=float, default=1.5)
-    parser.add_argument(
-        "--ssim-weight",
-        type=float,
-        default=0.2,
-        help="Blend weight for SSIM loss. 0 uses only ultrasound edge loss, 1 uses only SSIM.",
-    )
-    parser.add_argument(
-        "--ssim-window-size",
-        type=int,
-        default=11,
-        help="Odd local window size for SSIM loss. Even values are rounded up internally.",
-    )
-    parser.add_argument(
-        "--opacity-sparsity-weight",
-        type=float,
-        default=0.0,
-        help="Penalty on mean Gaussian opacity to reduce cloudy/saturated reconstructions.",
-    )
-    parser.add_argument("--filter-kernel-size", type=int, default=9)
-    parser.add_argument("--filter-sigma", type=float, default=1.0)
-    parser.add_argument(
-        "--low-intensity-threshold",
-        type=float,
-        default=None,
-        help="Set pixels below this grayscale value to 0 during data loading, using a 0-255 scale. Example: 25.",
-    )
-    parser.add_argument("--content-normalize", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--content-intensity-threshold", type=float, default=0.03)
-    parser.add_argument("--content-feature-threshold", type=float, default=0.05)
-    parser.add_argument("--content-background-weight", type=float, default=0.05)
-    parser.add_argument("--use-confidence", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--confidence-background-threshold", type=float, default=0.02)
-    parser.add_argument("--confidence-background-weight", type=float, default=0.0)
-    parser.add_argument("--confidence-dark-threshold", type=float, default=0.08)
-    parser.add_argument("--confidence-shadow-weight", type=float, default=0.2)
-    parser.add_argument("--confidence-bright-threshold", type=float, default=0.65)
-    parser.add_argument("--confidence-shadow-start-offset", type=int, default=8)
-    parser.add_argument("--shadow-confidence", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument(
-        "--accumulation-steps",
-        type=int,
-        default=1,
-        help="Number of shuffled slices to average before each optimizer update.",
-    )
-    parser.add_argument(
-        "--validation-slices",
-        type=int,
-        default=0,
-        help="Hold out this many fixed slices and report their loss during training.",
-    )
-    parser.add_argument(
-        "--validation-fraction",
-        type=float,
-        default=0.0,
-        help=(
-            "Hold out this fraction of slices for validation. Ignored when "
-            "--validation-slices is greater than 0."
-        ),
-    )
-    parser.add_argument(
-        "--validation-sources",
-        nargs="*",
-        default=None,
-        help=(
-            "Hold out entire image sources for validation. Values can be "
-            "0-based/1-based source indices or substrings such as right3. "
-            "Overrides --validation-slices and --validation-fraction."
-        ),
-    )
-    parser.add_argument(
-        "--validation-every",
-        type=int,
-        default=100,
-        help="Evaluate fixed validation slices every N optimizer steps.",
-    )
-    parser.add_argument(
-        "--validation-seed",
-        type=int,
-        default=1234,
-        help="Seed used to choose fixed validation slice indices.",
-    )
-    parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--densify-every", type=int, default=0)
-    parser.add_argument("--densify-start", type=int, default=100)
-    parser.add_argument("--densify-grad-threshold", type=float, default=1e-4)
-    parser.add_argument("--prune-opacity-threshold", type=float, default=0.02)
-    parser.add_argument("--split-scale-threshold", type=float, default=2.0)
-    parser.add_argument("--split-scale-factor", type=float, default=0.7)
-    parser.add_argument("--max-gaussians", type=int, default=10000)
-    parser.add_argument("--min-gaussians", type=int, default=100)
-    parser.add_argument("--max-new-gaussians", type=int, default=512)
-    parser.add_argument("--log-densify", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--debug-every", type=int, default=0)
-    parser.add_argument("--debug-dir", default="outputs/debug_visuals")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--amp",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use CUDA automatic mixed precision to reduce GPU memory.",
-    )
-    parser.add_argument("--grayscale", action="store_true")
-    parser.add_argument("--output", default="outputs/checkpoints/vanilla_gaussians.pt")
-    parser.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=0,
-        help="Save an extra .pt checkpoint and .json metadata every N optimizer steps. 0 disables periodic saves.",
-    )
-    return parser.parse_args()
+    parser.add_argument("config", nargs="?", help="Path to a JSON training config.")
+    parser.add_argument("--config", dest="config_flag", help="Path to a JSON training config.")
+    parsed, unknown = parser.parse_known_args()
+    if unknown:
+        parser.error(
+            "all training options now belong in the config JSON; only --config is accepted"
+        )
+    config_path = parsed.config_flag or parsed.config
+    if config_path is None:
+        parser.error("provide a config path, for example: python vanilla_gaussian_splatting.py --config train_config.json")
+    return load_train_config(config_path)
 
 
 if __name__ == "__main__":

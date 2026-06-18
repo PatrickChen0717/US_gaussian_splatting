@@ -1,0 +1,33 @@
+{
+  "image_dir": "spine_data/left1/images.npy",
+  "poses": "spine_data/left1/poses.npy",
+  "output": "outputs/checkpoints/vanilla_gaussians.pt",
+  "device": "cuda",
+
+  "height": 400,
+  "width": 148,
+  "grayscale": true,
+  "pixel_spacing_x": 1.0,
+  "pixel_spacing_y": 1.0,
+  "slice_thickness": 1.0,
+
+  "num_gaussians": 30000,
+  "init": "random",
+  "covariance_mode": "ultrasound_psf",
+  "initial_scale_x": 1.0,
+  "initial_scale_y": 0.5,
+  "initial_scale_z": 2.0,
+  "initial_opacity": 0.5,
+  "initial_transmittance": 0.99,
+
+  "shadowing": true,
+  "shadow_strength": 1.0,
+  "render_chunk_size": 16,
+  "max_visible_gaussians_per_slice": 2000,
+
+  "steps": 500,
+  "lr": 0.01,
+  "scale_prior_weight": 0.001,
+  "opacity_sparsity_weight": 0.0,
+  "ssim_weight": 0.2
+}
