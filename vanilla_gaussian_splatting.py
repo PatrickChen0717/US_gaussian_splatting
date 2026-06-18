@@ -17,6 +17,7 @@ from ultrasound_projection import (
     DEFAULT_PIXEL_TO_MM,
     render_ultrasound_gaussians,
 )
+from ultragray_cuda_backend import render_ultrasound_cuda
 
 
 TRAIN_CONFIG_DEFAULTS = {
@@ -27,6 +28,9 @@ TRAIN_CONFIG_DEFAULTS = {
     "num_gaussians": 512,
     "init": "random",
     "init_jitter_voxels": 0.5,
+    "svrtk_fill_fraction": 0.2,
+    "svrtk_fill_opacity": 0.05,
+    "svrtk_fill_endpoint_margin": 0.1,
     "grid_depth": 64,
     "grid_height": 64,
     "grid_width": 64,
@@ -58,6 +62,10 @@ TRAIN_CONFIG_DEFAULTS = {
     "lateral_depth_slope": 0.0,
     "elevational_depth_slope": 0.0,
     "acoustic_rendering": False,
+    "renderer_backend": "torch",
+    "ultragray_repo_path": None,
+    "cuda_tile_size_x": 4,
+    "cuda_tile_size_y": 128,
     "render_chunk_size": 128,
     "pixel_stride": 2,
     "intensity_threshold": 0.05,
@@ -153,6 +161,8 @@ def load_train_config(config_path):
         config["output"] = resolve_path(config["output"])
     if config["debug_dir"]:
         config["debug_dir"] = resolve_path(config["debug_dir"])
+    if config["ultragray_repo_path"]:
+        config["ultragray_repo_path"] = resolve_path(config["ultragray_repo_path"])
 
     config["config_path"] = str(config_path)
     config["loss_config_path"] = str(config_path)
@@ -163,6 +173,30 @@ def load_train_config(config_path):
             "config covariance_mode must be 'ultrasound_psf', "
             "'world_axis_aligned', or 'full_cholesky'"
         )
+    if config["renderer_backend"] not in {"torch", "ultragray_cuda"}:
+        raise ValueError("config renderer_backend must be 'torch' or 'ultragray_cuda'")
+    if int(config["cuda_tile_size_x"]) < 1 or int(config["cuda_tile_size_y"]) < 1:
+        raise ValueError("CUDA tile sizes must be positive")
+    if (
+        config["renderer_backend"] == "ultragray_cuda"
+        and config["covariance_mode"] != "ultrasound_psf"
+    ):
+        raise ValueError(
+            "ultragray_cuda currently supports covariance_mode='ultrasound_psf'"
+        )
+    if config["renderer_backend"] == "ultragray_cuda" and config["primitive_mode"] != "volume":
+        raise ValueError("ultragray_cuda currently supports primitive_mode='volume'")
+    if config["renderer_backend"] == "ultragray_cuda" and config["acoustic_rendering"]:
+        raise ValueError(
+            "ultragray_cuda already applies its acoustic echo/transmittance model; "
+            "set acoustic_rendering to false"
+        )
+    if not 0.0 <= float(config["svrtk_fill_fraction"]) <= 1.0:
+        raise ValueError("config svrtk_fill_fraction must be between 0 and 1")
+    if not 0.0 < float(config["svrtk_fill_opacity"]) < 1.0:
+        raise ValueError("config svrtk_fill_opacity must be between 0 and 1")
+    if not 0.0 <= float(config["svrtk_fill_endpoint_margin"]) < 0.5:
+        raise ValueError("config svrtk_fill_endpoint_margin must be in [0, 0.5)")
     ssim_weight = min(max(float(config["ssim_weight"]), 0.0), 1.0)
     ssim_window_size = int(config["ssim_window_size"])
     if ssim_window_size < 3:
@@ -191,6 +225,7 @@ class VanillaGaussianSplatting(nn.Module):
         initial_transmittance=0.99,
         initial_means=None,
         initial_colors=None,
+        initial_opacities=None,
     ):
         super().__init__()
         if initial_means is None:
@@ -211,11 +246,25 @@ class VanillaGaussianSplatting(nn.Module):
         self.raw_cholesky = nn.Parameter(
             self._initial_raw_cholesky(initial_scale.clamp_min(1e-6), num_gaussians)
         )
-        initial_opacity = float(initial_opacity)
-        if initial_opacity <= 0.0 or initial_opacity >= 1.0:
-            raise ValueError("initial_opacity must be between 0 and 1")
-        opacity_logit = torch.logit(torch.as_tensor(initial_opacity, dtype=torch.float32))
-        self.logit_opacities = nn.Parameter(opacity_logit.repeat(num_gaussians, 1))
+        if initial_opacities is None:
+            initial_opacity = float(initial_opacity)
+            if initial_opacity <= 0.0 or initial_opacity >= 1.0:
+                raise ValueError("initial_opacity must be between 0 and 1")
+            opacity_probabilities = torch.full(
+                (num_gaussians, 1),
+                initial_opacity,
+                dtype=torch.float32,
+            )
+        else:
+            opacity_probabilities = torch.as_tensor(
+                initial_opacities,
+                dtype=torch.float32,
+            ).reshape(-1, 1)
+            if len(opacity_probabilities) != num_gaussians:
+                raise ValueError("initial_opacities must contain one value per Gaussian")
+            if not ((opacity_probabilities > 0.0) & (opacity_probabilities < 1.0)).all():
+                raise ValueError("initial_opacities must be between 0 and 1")
+        self.logit_opacities = nn.Parameter(torch.logit(opacity_probabilities))
         initial_transmittance = float(initial_transmittance)
         if initial_transmittance <= 0.0 or initial_transmittance >= 1.0:
             raise ValueError("initial_transmittance must be between 0 and 1")
@@ -268,7 +317,40 @@ class VanillaGaussianSplatting(nn.Module):
         max_visible_gaussians_per_slice=None,
         primitive_mode="volume",
         acoustic_rendering=False,
+        renderer_backend="torch",
+        ultragray_repo_path=None,
+        cuda_tile_size_x=4,
+        cuda_tile_size_y=128,
     ):
+        if renderer_backend == "ultragray_cuda":
+            return render_ultrasound_cuda(
+                means=self.means,
+                scales=torch.exp(self.log_scales),
+                colors=self.colors,
+                opacities=self.logit_opacities,
+                transmittances=self.logit_transmittances,
+                slice_to_world=slice_to_world,
+                image_height=height,
+                image_width=width,
+                pixel_spacing=pixel_spacing,
+                image_t_probe=(
+                    DEFAULT_IMAGE_T_PROBE
+                    if image_t_probe is None
+                    else image_t_probe
+                ),
+                image_plane_origin_px=image_plane_origin_px,
+                pixel_to_mm=pixel_to_mm,
+                image_scale=image_scale,
+                shadowing=shadowing,
+                shadow_strength=shadow_strength,
+                max_visible_gaussians_per_slice=max_visible_gaussians_per_slice,
+                ultragray_repo_path=ultragray_repo_path,
+                tile_size_x=cuda_tile_size_x,
+                tile_size_y=cuda_tile_size_y,
+            )[0]
+        if renderer_backend != "torch":
+            raise ValueError(f"Unknown renderer backend: {renderer_backend}")
+
         disk_normals = None
         if primitive_mode == "disk":
             disk_normals = F.normalize(self.disk_normals, dim=-1, eps=1e-8)
@@ -890,6 +972,10 @@ def init_SVRTK(
     pixel_to_mm=DEFAULT_PIXEL_TO_MM,
     image_scale=1.0,
     jitter_voxels=0.5,
+    fill_fraction=0.2,
+    supported_opacity=0.5,
+    fill_opacity=0.05,
+    fill_endpoint_margin=0.1,
     device="cpu",
 ):
     """
@@ -897,10 +983,13 @@ def init_SVRTK(
 
     The function maps slice pixels into 3D with x = T_k y, averages the
     scattered intensities into a voxel grid, then seeds Gaussian centers from
-    high-intensity voxels in that initial volume X0.
+    high-intensity voxels in that initial volume X0. A configurable fraction
+    is sampled directly between consecutive tracked slices.
     """
     coords_per_slice = []
     values_per_slice = []
+    sequence_ids = []
+    pose_centers = []
     bounds_min = None
     bounds_max = None
 
@@ -920,6 +1009,11 @@ def init_SVRTK(
 
         coords_per_slice.append(coords)
         values_per_slice.append(values)
+        sequence_index = sample.get("sequence_index", 0)
+        if torch.is_tensor(sequence_index):
+            sequence_index = int(sequence_index.reshape(-1)[0].item())
+        sequence_ids.append(int(sequence_index))
+        pose_centers.append(pose[:3, 3])
         current_min = coords.min(dim=0).values
         current_max = coords.max(dim=0).values
         bounds_min = current_min if bounds_min is None else torch.minimum(bounds_min, current_min)
@@ -938,23 +1032,57 @@ def init_SVRTK(
     )
     initial_volume = volume / counts.clamp_min(1.0)
 
-    means, colors = sample_gaussians_from_volume(
+    fill_count = min(
+        max(round(num_gaussians * float(fill_fraction)), 0),
+        num_gaussians,
+    )
+    supported_count = num_gaussians - fill_count
+
+    supported_means, supported_colors = sample_gaussians_from_volume(
         initial_volume,
         counts,
         bounds_min,
         bounds_max,
-        num_gaussians,
+        supported_count,
         intensity_threshold=intensity_threshold,
         jitter_voxels=jitter_voxels,
+    )
+    fill_means, fill_colors = sample_between_tracked_slices(
+        coords_per_slice,
+        values_per_slice,
+        sequence_ids,
+        pose_centers,
+        fill_count,
+        endpoint_margin=fill_endpoint_margin,
+    )
+    means = torch.cat([supported_means, fill_means], dim=0)
+    colors = torch.cat([supported_colors, fill_colors], dim=0)
+    opacities = torch.cat(
+        [
+            torch.full(
+                (supported_count, 1),
+                float(supported_opacity),
+                device=means.device,
+            ),
+            torch.full(
+                (fill_count, 1),
+                float(fill_opacity),
+                device=means.device,
+            ),
+        ],
+        dim=0,
     )
 
     return {
         "means": means.cpu(),
         "colors": colors.cpu(),
+        "opacities": opacities.cpu(),
         "volume": initial_volume.cpu(),
         "counts": counts.cpu(),
         "bounds_min": bounds_min.cpu(),
         "bounds_max": bounds_max.cpu(),
+        "supported_count": supported_count,
+        "fill_count": fill_count,
     }
 
 
@@ -1029,6 +1157,94 @@ def scatter_slices_to_volume(coords_per_slice, values_per_slice, bounds_min, bou
     return volume, counts
 
 
+def sample_between_tracked_slices(
+    coords_per_slice,
+    values_per_slice,
+    sequence_ids,
+    pose_centers,
+    num_samples,
+    endpoint_margin=0.1,
+):
+    """Sample corresponding image locations between neighboring tracked planes."""
+    if num_samples <= 0:
+        channels = values_per_slice[0].shape[-1]
+        return (
+            coords_per_slice[0].new_empty((0, 3)),
+            values_per_slice[0].new_empty((0, channels)),
+        )
+
+    pair_indices = []
+    pair_weights = []
+    for index in range(len(coords_per_slice) - 1):
+        if sequence_ids[index] != sequence_ids[index + 1]:
+            continue
+        if len(coords_per_slice[index]) != len(coords_per_slice[index + 1]):
+            continue
+        spacing = torch.linalg.norm(pose_centers[index + 1] - pose_centers[index])
+        if not torch.isfinite(spacing) or spacing <= 1e-8:
+            continue
+        pair_indices.append(index)
+        pair_weights.append(spacing)
+
+    if not pair_indices:
+        raise ValueError(
+            "SVRTK between-slice fill requires consecutive poses from the same sequence"
+        )
+
+    weights = torch.stack(pair_weights).to(
+        device=coords_per_slice[0].device,
+        dtype=coords_per_slice[0].dtype,
+    )
+    chosen_pairs = torch.multinomial(
+        weights.clamp_min(1e-8),
+        num_samples,
+        replacement=True,
+    )
+
+    fill_means = coords_per_slice[0].new_empty((num_samples, 3))
+    channels = values_per_slice[0].shape[-1]
+    fill_colors = values_per_slice[0].new_empty((num_samples, channels))
+    endpoint_margin = min(max(float(endpoint_margin), 0.0), 0.499)
+
+    for pair_choice in torch.unique(chosen_pairs):
+        output_indices = torch.nonzero(
+            chosen_pairs == pair_choice,
+            as_tuple=False,
+        ).squeeze(-1)
+        pair_index = pair_indices[int(pair_choice.item())]
+        first_coords = coords_per_slice[pair_index]
+        second_coords = coords_per_slice[pair_index + 1]
+        first_values = values_per_slice[pair_index]
+        second_values = values_per_slice[pair_index + 1]
+
+        sample_count = len(output_indices)
+        pixel_indices = torch.randint(
+            0,
+            len(first_coords),
+            (sample_count,),
+            device=first_coords.device,
+        )
+        t = torch.rand(
+            sample_count,
+            1,
+            device=first_coords.device,
+            dtype=first_coords.dtype,
+        )
+        t = endpoint_margin + t * (1.0 - 2.0 * endpoint_margin)
+        fill_means[output_indices] = torch.lerp(
+            first_coords[pixel_indices],
+            second_coords[pixel_indices],
+            t,
+        )
+        fill_colors[output_indices] = torch.lerp(
+            first_values[pixel_indices],
+            second_values[pixel_indices],
+            t,
+        )
+
+    return fill_means, fill_colors.clamp(0.0, 1.0)
+
+
 def sample_gaussians_from_volume(
     volume,
     counts,
@@ -1050,7 +1266,9 @@ def sample_gaussians_from_volume(
 
     scores = intensity[candidate].clamp_min(1e-6)
     candidate_indices = candidate.nonzero(as_tuple=False)
-    if len(candidate_indices) >= num_gaussians:
+    if num_gaussians == 0:
+        chosen = torch.empty(0, device=volume.device, dtype=torch.long)
+    elif len(candidate_indices) >= num_gaussians:
         chosen = torch.multinomial(scores, num_gaussians, replacement=False)
     else:
         chosen = torch.multinomial(scores, num_gaussians, replacement=True)
@@ -1177,6 +1395,10 @@ def render_prediction(
         max_visible_gaussians_per_slice=args.max_visible_gaussians_per_slice,
         primitive_mode=args.primitive_mode,
         acoustic_rendering=args.acoustic_rendering,
+        renderer_backend=args.renderer_backend,
+        ultragray_repo_path=args.ultragray_repo_path,
+        cuda_tile_size_x=args.cuda_tile_size_x,
+        cuda_tile_size_y=args.cuda_tile_size_y,
     )
 
 
@@ -1415,6 +1637,7 @@ def train(args):
     channels = 1 if args.grayscale else 3
     initial_means = None
     initial_colors = None
+    initial_opacities = None
     if args.init == "svrtk":
         svrtk_init = init_SVRTK(
             train_dataset,
@@ -1428,11 +1651,20 @@ def train(args):
             pixel_to_mm=pixel_to_mm,
             image_scale=image_scale,
             jitter_voxels=args.init_jitter_voxels,
+            fill_fraction=args.svrtk_fill_fraction,
+            supported_opacity=args.initial_opacity,
+            fill_opacity=args.svrtk_fill_opacity,
+            fill_endpoint_margin=args.svrtk_fill_endpoint_margin,
             device=device,
         )
         initial_means = svrtk_init["means"]
         initial_colors = svrtk_init["colors"]
-        print(f"initialized {len(initial_means)} Gaussians from SVRTK volume")
+        initial_opacities = svrtk_init["opacities"]
+        print(
+            f"initialized {len(initial_means)} Gaussians from SVRTK volume: "
+            f"{svrtk_init['supported_count']} image-supported, "
+            f"{svrtk_init['fill_count']} between-slice fill"
+        )
 
     model = VanillaGaussianSplatting(
         args.num_gaussians,
@@ -1442,6 +1674,7 @@ def train(args):
         initial_transmittance=args.initial_transmittance,
         initial_means=initial_means,
         initial_colors=initial_colors,
+        initial_opacities=initial_opacities,
     ).to(device)
     pose_corrector = None
     if args.pose_correction == "source":

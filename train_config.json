@@ -12,7 +12,10 @@
   "slice_thickness": 1.0,
 
   "num_gaussians": 30000,
-  "init": "random",
+  "init": "svrtk",
+  "svrtk_fill_fraction": 0.3,
+  "svrtk_fill_opacity": 0.05,
+  "svrtk_fill_endpoint_margin": 0.1,
   "covariance_mode": "ultrasound_psf",
   "initial_scale_x": 1.0,
   "initial_scale_y": 0.5,
@@ -20,10 +23,15 @@
   "initial_opacity": 0.5,
   "initial_transmittance": 0.99,
 
+  "renderer_backend": "ultragray_cuda",
+  "ultragray_repo_path": "../UltraG-Ray",
+  "cuda_tile_size_x": 4,
+  "cuda_tile_size_y": 128,
+
   "shadowing": true,
   "shadow_strength": 1.0,
   "render_chunk_size": 16,
-  "max_visible_gaussians_per_slice": 2000,
+  "max_visible_gaussians_per_slice": null,
 
   "steps": 500,
   "lr": 0.01,
