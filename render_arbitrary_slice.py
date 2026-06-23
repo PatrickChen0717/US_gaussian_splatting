@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +8,7 @@ import torch
 from PIL import Image
 
 from load_data import TrackedUltrasoundDataset
+from ultragray_cuda_backend import load_ultragray_rasterizer
 from vanilla_gaussian_splatting import SourcePoseCorrection, VanillaGaussianSplatting
 
 
@@ -59,6 +61,162 @@ def load_model(checkpoint, device):
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     return model.to(device).eval()
+
+
+def is_native_checkpoint(checkpoint):
+    return "splats" in checkpoint and "model_state_dict" not in checkpoint
+
+
+def load_native_metadata(checkpoint_path, explicit_path=None):
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    candidates.append(Path(checkpoint_path).with_suffix(".json"))
+    for path in candidates:
+        if path.is_file():
+            with path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            print(f"loaded native metadata: {path}")
+            return metadata
+    return {}
+
+
+def native_image_size(args, metadata):
+    if args.height is not None and args.width is not None:
+        return int(args.height), int(args.width)
+    if args.image_dir:
+        frames = np.load(args.image_dir, mmap_mode="r")
+        if frames.ndim not in (3, 4):
+            raise ValueError(
+                f"Expected image NPY shape N,H,W or N,H,W,C, got {frames.shape}"
+            )
+        return int(frames.shape[1]), int(frames.shape[2])
+    height = metadata.get("height")
+    width = metadata.get("width")
+    if height is None or width is None:
+        raise ValueError(
+            "Native checkpoint rendering needs --image-dir, both --height and "
+            "--width, or a metadata JSON containing image dimensions."
+        )
+    return int(height), int(width)
+
+
+def native_raw_pose(args):
+    if args.pose_values:
+        pose = np.asarray(args.pose_values, dtype=np.float32).reshape(4, 4)
+    elif args.pose_matrix:
+        pose = load_matrix_file(args.pose_matrix, args.pose_array_index)
+    elif args.poses:
+        poses = np.load(args.poses)
+        if args.slice_index < 0 or args.slice_index >= len(poses):
+            raise IndexError(f"slice_index must be in [0, {len(poses) - 1}]")
+        pose = np.asarray(poses[args.slice_index], dtype=np.float32)
+    else:
+        pose = transform_from_parameters(args.translation_mm, args.rotation_deg)
+    return offset_pose(pose, args.offset_mm, args.offset_rotation_deg)
+
+
+def native_scene_center(args, metadata, translation_scale, opening_width, far_plane):
+    if args.native_scene_center is not None:
+        return np.asarray(args.native_scene_center, dtype=np.float32)
+    if "scene_center" in metadata:
+        return np.asarray(metadata["scene_center"], dtype=np.float32)
+    if not args.poses:
+        raise ValueError(
+            "Could not recover native scene centering. Provide --poses, "
+            "--native-metadata, or --native-scene-center X Y Z."
+        )
+
+    poses = np.asarray(np.load(args.poses), dtype=np.float32).copy()
+    poses[:, :3, 3] *= float(translation_scale)
+    corners = np.asarray(
+        [
+            [-0.5 * opening_width, 0.0, 0.0],
+            [0.5 * opening_width, 0.0, 0.0],
+            [0.5 * opening_width, 0.0, far_plane],
+            [-0.5 * opening_width, 0.0, far_plane],
+        ],
+        dtype=np.float32,
+    )
+    world = (
+        np.einsum("nij,kj->nki", poses[:, :3, :3], corners)
+        + poses[:, None, :3, 3]
+    )
+    return world.reshape(-1, 3).mean(axis=0)
+
+
+def render_native_checkpoint(checkpoint, args, device):
+    if device.type != "cuda":
+        raise RuntimeError(
+            "Native UltraG-Ray checkpoint rendering requires a CUDA device."
+        )
+    metadata = load_native_metadata(args.checkpoint, args.native_metadata)
+    height, width = native_image_size(args, metadata)
+    far_plane = float(metadata.get("far_plane", args.ultrasound_far_plane))
+    opening_width = float(
+        metadata.get("opening_width", args.ultrasound_opening_width)
+    )
+    translation_scale = float(
+        metadata.get(
+            "pose_translation_scale",
+            args.native_pose_translation_scale,
+        )
+    )
+    scene_center = native_scene_center(
+        args,
+        metadata,
+        translation_scale,
+        opening_width,
+        far_plane,
+    )
+    pose = native_raw_pose(args)
+    pose[:3, 3] *= translation_scale
+    pose[:3, 3] -= scene_center
+    camera_to_world = torch.as_tensor(
+        pose,
+        dtype=torch.float32,
+        device=device,
+    ).unsqueeze(0)
+
+    splats = {
+        name: value.detach().to(device)
+        for name, value in checkpoint["splats"].items()
+    }
+    intensities = torch.cat([splats["sh0"], splats["shN"]], dim=1)
+    native_shadowing = args.shadowing is not False
+    transmittances = torch.sigmoid(splats["transmittances"])
+    if not native_shadowing:
+        transmittances = torch.ones_like(transmittances)
+    sh_degree = (
+        int(args.native_sh_degree)
+        if args.native_sh_degree is not None
+        else max(int(round(math.sqrt(intensities.shape[1]) - 1)), 0)
+    )
+    rasterizer = load_ultragray_rasterizer(args.ultragray_repo_path)
+    render, _, _, _, _ = rasterizer(
+        means=splats["means"],
+        quats=splats["quats"],
+        scales=torch.exp(splats["scales"]),
+        transmittances=transmittances,
+        intensities=intensities,
+        viewmats=torch.linalg.inv(camera_to_world),
+        width=width,
+        height=height,
+        near_plane=0.0,
+        far_plane=far_plane,
+        opening_angle=None,
+        opening_width=opening_width,
+        tile_size_x=int(args.cuda_tile_size_x),
+        tile_size_y=int(args.cuda_tile_size_y),
+        sh_degree=sh_degree,
+    )
+    print(
+        "native render geometry: "
+        f"image={height}x{width}, opening_width={opening_width}, "
+        f"far_plane={far_plane}, shadowing={native_shadowing}, "
+        f"scene_center={scene_center.tolist()}"
+    )
+    return render[0].permute(2, 0, 1), pose, height, width
 
 
 def load_pose_correction(checkpoint, device):
@@ -398,10 +556,172 @@ def render_scene_preview(
     print(f"saved scene: {scene_output}")
 
 
+def render_native_scene_preview(
+    args,
+    checkpoint,
+    camera_to_world,
+    opening_width,
+    far_plane,
+):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    means = checkpoint["splats"]["means"].detach().float().cpu().numpy()
+    sh0 = checkpoint["splats"].get("sh0")
+    colors = None
+    if sh0 is not None:
+        intensity = (
+            sh0.detach().float().reshape(len(means), -1).mean(dim=1)
+            * 0.28209479177387814
+            + 0.5
+        ).clamp(0.0, 1.0).cpu().numpy()
+        colors = np.repeat(intensity[:, None], 3, axis=1)
+
+    if args.scene_max_points and len(means) > int(args.scene_max_points):
+        rng = np.random.default_rng(args.scene_seed)
+        keep = rng.choice(
+            len(means),
+            size=int(args.scene_max_points),
+            replace=False,
+        )
+        means = means[keep]
+        if colors is not None:
+            colors = colors[keep]
+
+    local_corners = np.asarray(
+        [
+            [-0.5 * opening_width, 0.0, 0.0, 1.0],
+            [0.5 * opening_width, 0.0, 0.0, 1.0],
+            [0.5 * opening_width, 0.0, far_plane, 1.0],
+            [-0.5 * opening_width, 0.0, far_plane, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    corners = (
+        np.asarray(camera_to_world, dtype=np.float32) @ local_corners.T
+    ).T[:, :3]
+    center = corners.mean(axis=0)
+    normal = np.asarray(camera_to_world, dtype=np.float32)[:3, 1]
+    normal /= max(np.linalg.norm(normal), 1e-8)
+    arrow_length = max(float(opening_width), float(far_plane)) * 0.35
+
+    scene_output = (
+        Path(args.scene_output)
+        if args.scene_output
+        else Path(args.output).with_name(f"{Path(args.output).stem}_scene.png")
+    )
+    scene_output.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(9, 8), facecolor="white")
+    ax = fig.add_subplot(111, projection="3d")
+    point_colors = colors if colors is not None else np.full((len(means), 3), 0.35)
+    ax.scatter(
+        means[:, 0],
+        means[:, 1],
+        means[:, 2],
+        c=point_colors,
+        s=float(args.scene_point_size),
+        alpha=float(args.scene_point_alpha),
+        depthshade=False,
+    )
+    plane = Poly3DCollection(
+        [corners],
+        facecolors=(0.0, 0.85, 0.95, 0.16),
+        edgecolors=(0.0, 0.75, 0.85, 1.0),
+        linewidths=2.5,
+    )
+    ax.add_collection3d(plane)
+    closed = np.vstack([corners, corners[0]])
+    ax.plot(closed[:, 0], closed[:, 1], closed[:, 2], color="cyan", linewidth=3.0)
+    ax.quiver(
+        center[0],
+        center[1],
+        center[2],
+        normal[0],
+        normal[1],
+        normal[2],
+        length=arrow_length,
+        color="magenta",
+        linewidth=2.5,
+        normalize=True,
+    )
+
+    all_points = np.vstack([means, corners])
+    mins = all_points.min(axis=0)
+    maxs = all_points.max(axis=0)
+    bounds_center = (mins + maxs) * 0.5
+    radius = max(float(np.max(maxs - mins) * 0.55), 0.1)
+    ax.set_xlim(bounds_center[0] - radius, bounds_center[0] + radius)
+    ax.set_ylim(bounds_center[1] - radius, bounds_center[1] + radius)
+    ax.set_zlim(bounds_center[2] - radius, bounds_center[2] + radius)
+    ax.view_init(elev=args.scene_elev, azim=args.scene_azim)
+    ax.set_xlabel("X cm")
+    ax.set_ylabel("Y cm")
+    ax.set_zlabel("Z cm")
+    ax.set_title("Rendered Slice Plane in Native UltraG-Ray Gaussians")
+    fig.tight_layout()
+    fig.savefig(scene_output, dpi=args.scene_dpi)
+    plt.close(fig)
+    print(f"saved scene: {scene_output}")
+
+
 def render(args):
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(
+        args.checkpoint,
+        map_location="cpu",
+        weights_only=True,
+    )
     requested_device = args.device
     device = torch.device(requested_device if torch.cuda.is_available() or requested_device == "cpu" else "cpu")
+
+    if is_native_checkpoint(checkpoint):
+        with torch.no_grad():
+            pred, pose_np, _, _ = render_native_checkpoint(
+                checkpoint,
+                args,
+                device,
+            )
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        display_pred = adjust_display_intensity(
+            pred,
+            gain=args.display_gain,
+            gamma=args.display_gamma,
+            normalize=args.display_normalize,
+            percentile=args.display_percentile,
+        )
+        image_tensor_to_pil(display_pred).save(output_path)
+        if args.save_npy:
+            np.save(output_path.with_suffix(".npy"), pred.cpu().numpy())
+        if args.save_pose:
+            np.save(
+                output_path.with_name(f"{output_path.stem}_pose.npy"),
+                pose_np,
+            )
+        if args.scene:
+            metadata = load_native_metadata(
+                args.checkpoint,
+                args.native_metadata,
+            )
+            render_native_scene_preview(
+                args,
+                checkpoint,
+                pose_np,
+                float(
+                    metadata.get(
+                        "opening_width",
+                        args.ultrasound_opening_width,
+                    )
+                ),
+                float(
+                    metadata.get(
+                        "far_plane",
+                        args.ultrasound_far_plane,
+                    )
+                ),
+            )
+        print(f"saved image: {output_path}")
+        print(f"pose:\n{pose_np}")
+        return
 
     model = load_model(checkpoint, device)
     pose_correction = load_pose_correction(checkpoint, device)
@@ -439,7 +759,7 @@ def render(args):
             slice_thickness=args.slice_thickness
             if args.slice_thickness is not None
             else checkpoint_value(checkpoint, "slice_thickness", 1.0),
-            shadowing=args.shadowing,
+            shadowing=bool(args.shadowing),
             shadow_strength=checkpoint_value(checkpoint, "shadow_strength", 1.0),
             image_t_probe=image_t_probe,
             image_plane_origin_px=tuple(image_origin),
@@ -503,6 +823,15 @@ def parse_args():
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--render-chunk-size", type=int, default=8)
+    parser.add_argument("--native-metadata", default=None)
+    parser.add_argument("--native-scene-center", type=float, nargs=3, default=None)
+    parser.add_argument("--native-pose-translation-scale", type=float, default=0.1)
+    parser.add_argument("--ultrasound-far-plane", type=float, default=9.0)
+    parser.add_argument("--ultrasound-opening-width", type=float, default=5.13)
+    parser.add_argument("--ultragray-repo-path", default="../UltraG-Ray")
+    parser.add_argument("--cuda-tile-size-x", type=int, default=4)
+    parser.add_argument("--cuda-tile-size-y", type=int, default=128)
+    parser.add_argument("--native-sh-degree", type=int, default=None)
 
     pose_group = parser.add_argument_group("probe plane pose")
     pose_group.add_argument("--pose-matrix", default=None, help="Path to a 4x4 or Nx4x4 pose matrix in npy/json/csv/txt.")
@@ -532,7 +861,15 @@ def parse_args():
     render_group.add_argument("--slice-thickness", type=float, default=None)
     render_group.add_argument("--pixel-to-mm", type=float, default=None)
     render_group.add_argument("--image-scale", type=float, default=None)
-    render_group.add_argument("--shadowing", action=argparse.BooleanOptionalAction, default=False)
+    render_group.add_argument(
+        "--shadowing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Control learned attenuation. Native UltraG-Ray checkpoints "
+            "default to enabled; older checkpoints default to disabled."
+        ),
+    )
     render_group.add_argument("--acoustic-rendering", action=argparse.BooleanOptionalAction, default=True)
     render_group.add_argument("--save-npy", action="store_true")
     render_group.add_argument("--save-pose", action="store_true")

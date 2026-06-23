@@ -135,10 +135,19 @@ class UltrasoundCalibration:
 
 def list_image_files(image_dir):
     image_dir = Path(image_dir)
-    return sorted(
-        path for path in image_dir.iterdir()
+    paths = [
+        path
+        for path in image_dir.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    ]
+
+    def natural_key(path):
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", path.name)
+        ]
+
+    return sorted(paths, key=natural_key)
 
 
 def is_mha_path(path):
@@ -335,13 +344,41 @@ def load_image_tensor(path, grayscale=True, image_size=None, low_intensity_thres
     return tensor
 
 
-def frame_to_tensor(frame, grayscale=True, image_size=None, low_intensity_threshold=LOW_INTENSITY_THRESHOLD):
+def frame_to_tensor(
+    frame,
+    grayscale=True,
+    image_size=None,
+    low_intensity_threshold=LOW_INTENSITY_THRESHOLD,
+    image_value_scale=255.0,
+    ultragray_exact=False,
+):
     frame = np.asarray(frame)
+    if ultragray_exact:
+        if frame.ndim == 3:
+            frame = np.mean(frame, axis=-1)
+        if frame.ndim != 2:
+            raise ValueError(
+                "UltraG-Ray image loading expects a grayscale frame or an "
+                f"RGB-like frame, got shape {frame.shape}"
+            )
+        tensor = torch.from_numpy(
+            frame.astype(np.float32, copy=False) / 255.0
+        ).unsqueeze(0)
+        if image_size is not None and tuple(tensor.shape[-2:]) != tuple(image_size):
+            tensor = F.interpolate(
+                tensor.unsqueeze(0),
+                size=image_size,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        return tensor.float()
+
     frame_float = frame.astype(np.float32, copy=False)
-    if np.issubdtype(frame.dtype, np.integer):
-        frame_float = frame_float / float(np.iinfo(frame.dtype).max)
-    elif frame_float.size and float(np.nanmax(frame_float)) > 1.0:
-        frame_float = frame_float / 255.0
+    finite_max = float(np.nanmax(frame_float)) if frame_float.size else 0.0
+    if finite_max > 1.0:
+        if image_value_scale is None or float(image_value_scale) <= 0.0:
+            raise ValueError("image_value_scale must be positive")
+        frame_float = frame_float / float(image_value_scale)
     frame_float = np.nan_to_num(frame_float, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
 
     if frame_float.ndim == 2:
@@ -380,6 +417,8 @@ class TrackedUltrasoundDataset(Dataset):
         grayscale=GRAYSCALE,
         only_ok_poses=ONLY_OK_POSES,
         low_intensity_threshold=LOW_INTENSITY_THRESHOLD,
+        image_value_scale=255.0,
+        ultragray_exact=False,
     ):
         image_source = Path(image_dir)
         self.frames = None
@@ -393,6 +432,7 @@ class TrackedUltrasoundDataset(Dataset):
                     f"Expected .npy images with shape [N, H, W] or [N, H, W, C], "
                     f"got {self.frames.shape}"
                 )
+            self.original_image_size = tuple(self.frames.shape[1:3])
             self.timestamps = None
             self.poses = load_pose_file(poses_path, only_ok=only_ok_poses)
         elif image_source.is_file() and is_mha_path(image_source):
@@ -400,11 +440,17 @@ class TrackedUltrasoundDataset(Dataset):
                 image_source,
                 only_ok=only_ok_poses,
             )
+            self.original_image_size = tuple(self.frames.shape[1:3])
             self.poses = load_pose_file(poses_path, only_ok=only_ok_poses) if poses_path else mha_poses
         else:
             self.image_paths = list_image_files(image_source)
             if not self.image_paths:
                 raise ValueError(f"No images found in {image_dir}")
+            with Image.open(self.image_paths[0]) as first_image:
+                self.original_image_size = (
+                    int(first_image.height),
+                    int(first_image.width),
+                )
             self.timestamps = None
             self.poses = load_pose_file(poses_path, only_ok=only_ok_poses)
 
@@ -419,6 +465,8 @@ class TrackedUltrasoundDataset(Dataset):
         self.image_size = image_size
         self.grayscale = grayscale
         self.low_intensity_threshold = low_intensity_threshold
+        self.image_value_scale = image_value_scale
+        self.ultragray_exact = ultragray_exact
 
     def __len__(self):
         if self.frames is not None:
@@ -432,15 +480,29 @@ class TrackedUltrasoundDataset(Dataset):
                 grayscale=self.grayscale,
                 image_size=self.image_size,
                 low_intensity_threshold=self.low_intensity_threshold,
+                image_value_scale=self.image_value_scale,
+                ultragray_exact=self.ultragray_exact,
             )
             path = f"{self.source_name}::frame_{index:06d}"
         else:
-            image = load_image_tensor(
-                self.image_paths[index],
-                grayscale=self.grayscale,
-                image_size=self.image_size,
-                low_intensity_threshold=self.low_intensity_threshold,
-            )
+            if self.ultragray_exact:
+                with Image.open(self.image_paths[index]) as source_image:
+                    frame = np.asarray(source_image.convert("RGB"))
+                image = frame_to_tensor(
+                    frame,
+                    grayscale=True,
+                    image_size=self.image_size,
+                    low_intensity_threshold=None,
+                    image_value_scale=255.0,
+                    ultragray_exact=True,
+                )
+            else:
+                image = load_image_tensor(
+                    self.image_paths[index],
+                    grayscale=self.grayscale,
+                    image_size=self.image_size,
+                    low_intensity_threshold=self.low_intensity_threshold,
+                )
             path = str(self.image_paths[index])
 
         if self.poses is None:
@@ -465,6 +527,8 @@ class MultiTrackedUltrasoundDataset(Dataset):
         grayscale=GRAYSCALE,
         only_ok_poses=ONLY_OK_POSES,
         low_intensity_threshold=LOW_INTENSITY_THRESHOLD,
+        image_value_scale=255.0,
+        ultragray_exact=False,
     ):
         if isinstance(image_dirs, (str, Path)):
             image_dirs = [image_dirs]
@@ -497,6 +561,8 @@ class MultiTrackedUltrasoundDataset(Dataset):
                 grayscale=grayscale,
                 only_ok_poses=only_ok_poses,
                 low_intensity_threshold=low_intensity_threshold,
+                image_value_scale=image_value_scale,
+                ultragray_exact=ultragray_exact,
             )
             for image_dir, poses_path in zip(image_dirs, poses_paths)
         ]

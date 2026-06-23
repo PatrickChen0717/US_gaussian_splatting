@@ -23,6 +23,8 @@ from ultragray_cuda_backend import render_ultrasound_cuda
 TRAIN_CONFIG_DEFAULTS = {
     "image_dir": [],
     "poses": None,
+    "image_dir_val": None,
+    "pose_val": None,
     "height": 128,
     "width": 128,
     "num_gaussians": 512,
@@ -66,6 +68,22 @@ TRAIN_CONFIG_DEFAULTS = {
     "ultragray_repo_path": None,
     "cuda_tile_size_x": 4,
     "cuda_tile_size_y": 128,
+    "native_pose_translation_scale": 0.1,
+    "native_pose_convention": "probe_to_world",
+    "native_ultragray_exact": False,
+    "native_ultragray_loader_exact": True,
+    "native_global_scale": 1.0,
+    "native_init_extent": 0.8,
+    "native_init_scale": 0.05,
+    "native_grow_scale3d": 0.01,
+    "native_prune_scale3d": 0.1,
+    "native_prune_scale3d_min": 1e-5,
+    "random_seed": 42,
+    "ultrasound_far_plane": 5.0,
+    "ultrasound_opening_width": None,
+    "pose_sideways_noise": 0.0,
+    "pose_frontback_noise": 0.2,
+    "pose_updown_noise": 0.0,
     "render_chunk_size": 128,
     "pixel_stride": 2,
     "intensity_threshold": 0.05,
@@ -76,12 +94,15 @@ TRAIN_CONFIG_DEFAULTS = {
     "edge_loss_weight": 1.0,
     "intensity_loss_weight": 0.05,
     "sobel_loss_weight": 1.5,
+    "ultrasound_edges_weight": 0.8,
+    "l1_weight": 0.5,
     "ssim_weight": 0.2,
     "ssim_window_size": 11,
     "opacity_sparsity_weight": 0.0,
     "filter_kernel_size": 9,
     "filter_sigma": 1.0,
     "low_intensity_threshold": None,
+    "image_value_scale": 255.0,
     "content_normalize": True,
     "content_intensity_threshold": 0.03,
     "content_feature_threshold": 0.05,
@@ -95,6 +116,7 @@ TRAIN_CONFIG_DEFAULTS = {
     "confidence_shadow_start_offset": 8,
     "shadow_confidence": True,
     "steps": 500,
+    "batch_size": 8,
     "accumulation_steps": 1,
     "validation_slices": 0,
     "validation_fraction": 0.0,
@@ -102,9 +124,19 @@ TRAIN_CONFIG_DEFAULTS = {
     "validation_every": 100,
     "validation_seed": 1234,
     "lr": 1e-2,
+    "means_lr": 1e-4,
+    "scales_lr": 5e-3,
+    "quats_lr": 5e-3,
+    "transmittances_lr": 5e-4,
+    "intensity_lr": 5e-3,
+    "sh_rest_lr": 1e-5,
+    "lr_final_factor": 0.1,
+    "sh_degree": 1,
+    "sh_degree_interval": 1000,
     "log_every": 25,
     "densify_every": 0,
     "densify_start": 100,
+    "densify_stop": 20000,
     "densify_grad_threshold": 1e-4,
     "prune_opacity_threshold": 0.02,
     "split_scale_threshold": 2.0,
@@ -120,6 +152,9 @@ TRAIN_CONFIG_DEFAULTS = {
     "grayscale": False,
     "output": "outputs/checkpoints/vanilla_gaussians.pt",
     "checkpoint_every": 0,
+    "export_sog": True,
+    "splat_transform": "splat-transform",
+    "sog_gpu": None,
 }
 
 
@@ -143,8 +178,21 @@ def load_train_config(config_path):
         config["image_dir"] = [config["image_dir"]]
     if config["poses"] is not None and isinstance(config["poses"], str):
         config["poses"] = [config["poses"]]
+    if config["image_dir_val"] is not None and isinstance(config["image_dir_val"], str):
+        config["image_dir_val"] = [config["image_dir_val"]]
+    if config["pose_val"] is not None and isinstance(config["pose_val"], str):
+        config["pose_val"] = [config["pose_val"]]
     if config["validation_sources"] is not None and isinstance(config["validation_sources"], str):
         config["validation_sources"] = [config["validation_sources"]]
+    if config["pose_val"] and not config["image_dir_val"]:
+        raise ValueError(f"{config_path} sets pose_val without image_dir_val")
+    if config["image_dir_val"] and config["pose_val"] is not None:
+        if len(config["pose_val"]) != len(config["image_dir_val"]):
+            raise ValueError(
+                f"{config_path} must provide one pose_val per image_dir_val; "
+                f"got {len(config['pose_val'])} poses for "
+                f"{len(config['image_dir_val'])} image sources"
+            )
 
     def resolve_path(value):
         if value is None:
@@ -157,6 +205,12 @@ def load_train_config(config_path):
     config["image_dir"] = [resolve_path(path) for path in config["image_dir"]]
     if config["poses"] is not None:
         config["poses"] = [resolve_path(path) for path in config["poses"]]
+    if config["image_dir_val"] is not None:
+        config["image_dir_val"] = [
+            resolve_path(path) for path in config["image_dir_val"]
+        ]
+    if config["pose_val"] is not None:
+        config["pose_val"] = [resolve_path(path) for path in config["pose_val"]]
     if config["output"]:
         config["output"] = resolve_path(config["output"])
     if config["debug_dir"]:
@@ -198,11 +252,70 @@ def load_train_config(config_path):
     if not 0.0 <= float(config["svrtk_fill_endpoint_margin"]) < 0.5:
         raise ValueError("config svrtk_fill_endpoint_margin must be in [0, 0.5)")
     ssim_weight = min(max(float(config["ssim_weight"]), 0.0), 1.0)
+    ultrasound_edges_weight = float(config["ultrasound_edges_weight"])
+    l1_weight = float(config["l1_weight"])
+    scale_prior_weight = float(config["scale_prior_weight"])
+    if ultrasound_edges_weight < 0.0:
+        raise ValueError("config ultrasound_edges_weight must be non-negative")
+    if l1_weight < 0.0:
+        raise ValueError("config l1_weight must be non-negative")
+    if scale_prior_weight < 0.0:
+        raise ValueError("config scale_prior_weight must be non-negative")
+    if int(config["batch_size"]) < 1 or int(config["batch_size"]) > 10:
+        raise ValueError("config batch_size must be between 1 and 10")
+    if float(config["native_pose_translation_scale"]) <= 0.0:
+        raise ValueError("config native_pose_translation_scale must be positive")
+    if config["native_pose_convention"] not in {
+        "probe_to_world",
+        "camera_to_world",
+    }:
+        raise ValueError(
+            "config native_pose_convention must be "
+            "'probe_to_world' or 'camera_to_world'"
+        )
+    if float(config["native_global_scale"]) <= 0.0:
+        raise ValueError("config native_global_scale must be positive")
+    if float(config["native_init_extent"]) <= 0.0:
+        raise ValueError("config native_init_extent must be positive")
+    if float(config["native_init_scale"]) <= 0.0:
+        raise ValueError("config native_init_scale must be positive")
+    if float(config["native_grow_scale3d"]) <= 0.0:
+        raise ValueError("config native_grow_scale3d must be positive")
+    if float(config["native_prune_scale3d"]) <= 0.0:
+        raise ValueError("config native_prune_scale3d must be positive")
+    if float(config["native_prune_scale3d_min"]) < 0.0:
+        raise ValueError("config native_prune_scale3d_min must be non-negative")
+    if float(config["image_value_scale"]) <= 0.0:
+        raise ValueError("config image_value_scale must be positive")
+    if float(config["ultrasound_far_plane"]) <= 0.0:
+        raise ValueError("config ultrasound_far_plane must be positive")
+    if (
+        config["ultrasound_opening_width"] is not None
+        and float(config["ultrasound_opening_width"]) <= 0.0
+    ):
+        raise ValueError("config ultrasound_opening_width must be positive")
+    for noise_key in (
+        "pose_sideways_noise",
+        "pose_frontback_noise",
+        "pose_updown_noise",
+    ):
+        if float(config[noise_key]) < 0.0:
+            raise ValueError(f"config {noise_key} must be non-negative")
+    if (
+        int(config["densify_every"]) > 0
+        and int(config["max_gaussians"]) < int(config["num_gaussians"])
+    ):
+        config["max_gaussians"] = int(config["num_gaussians"])
+    if int(config["densify_stop"]) < int(config["densify_start"]):
+        raise ValueError("config densify_stop must be at least densify_start")
     ssim_window_size = int(config["ssim_window_size"])
     if ssim_window_size < 3:
         raise ValueError("config ssim_window_size must be at least 3")
 
     config["ssim_weight"] = ssim_weight
+    config["ultrasound_edges_weight"] = ultrasound_edges_weight
+    config["l1_weight"] = l1_weight
+    config["scale_prior_weight"] = scale_prior_weight
     config["ssim_window_size"] = ssim_window_size
     return argparse.Namespace(**config)
 
@@ -226,8 +339,10 @@ class VanillaGaussianSplatting(nn.Module):
         initial_means=None,
         initial_colors=None,
         initial_opacities=None,
+        lean_storage=False,
     ):
         super().__init__()
+        self.lean_storage = bool(lean_storage)
         if initial_means is None:
             means = torch.empty(num_gaussians, 3)
             means[:, :2].uniform_(-scene_scale, scene_scale)
@@ -243,9 +358,15 @@ class VanillaGaussianSplatting(nn.Module):
         if initial_scale.shape != (3,):
             raise ValueError("initial_scale must be a scalar or a 3-value sequence")
         self.log_scales = nn.Parameter(initial_scale.clamp_min(1e-6).log().repeat(num_gaussians, 1))
-        self.raw_cholesky = nn.Parameter(
-            self._initial_raw_cholesky(initial_scale.clamp_min(1e-6), num_gaussians)
-        )
+        if self.lean_storage:
+            self.register_parameter("raw_cholesky", None)
+        else:
+            self.raw_cholesky = nn.Parameter(
+                self._initial_raw_cholesky(
+                    initial_scale.clamp_min(1e-6),
+                    num_gaussians,
+                )
+            )
         if initial_opacities is None:
             initial_opacity = float(initial_opacity)
             if initial_opacity <= 0.0 or initial_opacity >= 1.0:
@@ -288,12 +409,18 @@ class VanillaGaussianSplatting(nn.Module):
                     raise ValueError("initial_colors must match the requested channel count")
 
         self.colors = nn.Parameter(colors.clamp(0.0, 1.0))
-        normals = torch.randn(num_gaussians, 3) * 0.01
-        normals[:, 2] = 1.0
-        self.disk_normals = nn.Parameter(normals)
-        self.acoustic_attenuation = nn.Parameter(torch.tensor(-4.0))
-        self.acoustic_reflection = nn.Parameter(torch.tensor(-4.0))
-        self.acoustic_scattering = nn.Parameter(torch.tensor(-4.0))
+        if self.lean_storage:
+            self.register_parameter("disk_normals", None)
+            self.register_parameter("acoustic_attenuation", None)
+            self.register_parameter("acoustic_reflection", None)
+            self.register_parameter("acoustic_scattering", None)
+        else:
+            normals = torch.randn(num_gaussians, 3) * 0.01
+            normals[:, 2] = 1.0
+            self.disk_normals = nn.Parameter(normals)
+            self.acoustic_attenuation = nn.Parameter(torch.tensor(-4.0))
+            self.acoustic_reflection = nn.Parameter(torch.tensor(-4.0))
+            self.acoustic_scattering = nn.Parameter(torch.tensor(-4.0))
 
     def forward(
         self,
@@ -353,10 +480,21 @@ class VanillaGaussianSplatting(nn.Module):
 
         disk_normals = None
         if primitive_mode == "disk":
+            if self.disk_normals is None:
+                raise RuntimeError("disk primitives are unavailable with lean CUDA storage")
             disk_normals = F.normalize(self.disk_normals, dim=-1, eps=1e-8)
         covariances = None
         if covariance_mode == "full_cholesky":
             covariances = self.full_covariances(min_scale_mm=min_scale_mm, max_scale_mm=max_scale_mm)
+        attenuation_weight = 0.0
+        reflection_weight = 0.0
+        scattering_weight = 0.0
+        if acoustic_rendering:
+            if self.acoustic_attenuation is None:
+                raise RuntimeError("acoustic_rendering is unavailable with lean CUDA storage")
+            attenuation_weight = F.softplus(self.acoustic_attenuation)
+            reflection_weight = F.softplus(self.acoustic_reflection)
+            scattering_weight = F.softplus(self.acoustic_scattering)
 
         image, _ = render_ultrasound_gaussians(
             self.means,
@@ -385,9 +523,9 @@ class VanillaGaussianSplatting(nn.Module):
             primitive_mode=primitive_mode,
             disk_normals=disk_normals,
             acoustic_rendering=acoustic_rendering,
-            attenuation_weight=F.softplus(self.acoustic_attenuation),
-            reflection_weight=F.softplus(self.acoustic_reflection),
-            scattering_weight=F.softplus(self.acoustic_scattering),
+            attenuation_weight=attenuation_weight,
+            reflection_weight=reflection_weight,
+            scattering_weight=scattering_weight,
             covariances=covariances,
         )
         return image
@@ -408,6 +546,8 @@ class VanillaGaussianSplatting(nn.Module):
 
     def cholesky_factors(self, min_scale_mm=0.05, max_scale_mm=10.0):
         raw = self.raw_cholesky
+        if raw is None:
+            raise RuntimeError("full Cholesky covariance is unavailable with lean CUDA storage")
         diag = F.softplus(raw[:, [0, 2, 5]]).clamp(min_scale_mm, max_scale_mm)
         offdiag = raw[:, [1, 3, 4]].clamp(-max_scale_mm, max_scale_mm)
         factors = raw.new_zeros((len(raw), 3, 3))
@@ -454,11 +594,20 @@ class VanillaGaussianSplatting(nn.Module):
             torch.log(torch.as_tensor(min_scale_mm, device=self.log_scales.device)),
             torch.log(torch.as_tensor(max_scale_mm, device=self.log_scales.device)),
         )
-        self.raw_cholesky.nan_to_num_(nan=0.0, posinf=max_scale_mm, neginf=-max_scale_mm)
-        self.raw_cholesky[:, [1, 3, 4]].clamp_(-max_scale_mm, max_scale_mm)
-        raw_min = self._inverse_softplus(torch.as_tensor(min_scale_mm, device=self.raw_cholesky.device))
-        raw_max = self._inverse_softplus(torch.as_tensor(max_scale_mm, device=self.raw_cholesky.device))
-        self.raw_cholesky[:, [0, 2, 5]].clamp_(raw_min, raw_max)
+        if self.raw_cholesky is not None:
+            self.raw_cholesky.nan_to_num_(
+                nan=0.0,
+                posinf=max_scale_mm,
+                neginf=-max_scale_mm,
+            )
+            self.raw_cholesky[:, [1, 3, 4]].clamp_(-max_scale_mm, max_scale_mm)
+            raw_min = self._inverse_softplus(
+                torch.as_tensor(min_scale_mm, device=self.raw_cholesky.device)
+            )
+            raw_max = self._inverse_softplus(
+                torch.as_tensor(max_scale_mm, device=self.raw_cholesky.device)
+            )
+            self.raw_cholesky[:, [0, 2, 5]].clamp_(raw_min, raw_max)
         self.logit_opacities.nan_to_num_(nan=0.0, posinf=10.0, neginf=-10.0)
         self.logit_opacities.clamp_(-10.0, 10.0)
         if not hasattr(self, "logit_transmittances"):
@@ -472,11 +621,13 @@ class VanillaGaussianSplatting(nn.Module):
         self.logit_transmittances.clamp_(-10.0, 10.0)
         self.colors.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
         self.colors.clamp_(0.0, 1.0)
-        self.disk_normals.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
-        self.disk_normals.clamp_(-1.0, 1.0)
-        self.acoustic_attenuation.clamp_(-10.0, 5.0)
-        self.acoustic_reflection.clamp_(-10.0, 5.0)
-        self.acoustic_scattering.clamp_(-10.0, 5.0)
+        if self.disk_normals is not None:
+            self.disk_normals.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
+            self.disk_normals.clamp_(-1.0, 1.0)
+        if self.acoustic_attenuation is not None:
+            self.acoustic_attenuation.clamp_(-10.0, 5.0)
+            self.acoustic_reflection.clamp_(-10.0, 5.0)
+            self.acoustic_scattering.clamp_(-10.0, 5.0)
 
     @torch.no_grad()
     def densify_and_prune(
@@ -508,11 +659,19 @@ class VanillaGaussianSplatting(nn.Module):
 
         means = self.means.data[keep]
         log_scales = self.log_scales.data[keep]
-        raw_cholesky = self.raw_cholesky.data[keep]
+        raw_cholesky = (
+            None
+            if self.raw_cholesky is None
+            else self.raw_cholesky.data[keep]
+        )
         logit_opacities = self.logit_opacities.data[keep]
         logit_transmittances = self.logit_transmittances.data[keep]
         colors = self.colors.data[keep]
-        disk_normals = self.disk_normals.data[keep]
+        disk_normals = (
+            None
+            if self.disk_normals is None
+            else self.disk_normals.data[keep]
+        )
 
         grad = self.means.grad
         if grad is None:
@@ -533,7 +692,11 @@ class VanillaGaussianSplatting(nn.Module):
             split_indices = split_indices[: min(len(split_indices), remaining_capacity, max_new_gaussians)]
             parent_means = means[split_indices]
             parent_log_scales = log_scales[split_indices]
-            parent_raw_cholesky = raw_cholesky[split_indices]
+            parent_raw_cholesky = (
+                None
+                if raw_cholesky is None
+                else raw_cholesky[split_indices]
+            )
             if covariance_mode == "full_cholesky":
                 parent_scales = scales[split_indices]
             else:
@@ -544,41 +707,67 @@ class VanillaGaussianSplatting(nn.Module):
             child_log_scales = parent_log_scales + torch.log(
                 torch.as_tensor(split_factor, device=device, dtype=parent_log_scales.dtype)
             )
-            child_raw_cholesky = parent_raw_cholesky.clone()
-            child_raw_cholesky[:, [0, 2, 5]] = child_raw_cholesky[:, [0, 2, 5]] + torch.log(
-                torch.as_tensor(split_factor, device=device, dtype=parent_raw_cholesky.dtype)
-            )
-            child_raw_cholesky[:, [1, 3, 4]] = child_raw_cholesky[:, [1, 3, 4]] * split_factor
+            child_raw_cholesky = None
+            if parent_raw_cholesky is not None:
+                child_raw_cholesky = parent_raw_cholesky.clone()
+                child_raw_cholesky[:, [0, 2, 5]] = (
+                    child_raw_cholesky[:, [0, 2, 5]]
+                    + torch.log(
+                        torch.as_tensor(
+                            split_factor,
+                            device=device,
+                            dtype=parent_raw_cholesky.dtype,
+                        )
+                    )
+                )
+                child_raw_cholesky[:, [1, 3, 4]] = (
+                    child_raw_cholesky[:, [1, 3, 4]] * split_factor
+                )
             child_logit_opacities = logit_opacities[split_indices] - torch.log(
                 torch.as_tensor(2.0, device=device, dtype=logit_opacities.dtype)
             )
             child_logit_transmittances = logit_transmittances[split_indices]
             child_colors = colors[split_indices]
-            child_disk_normals = disk_normals[split_indices]
+            child_disk_normals = (
+                None
+                if disk_normals is None
+                else disk_normals[split_indices]
+            )
 
             means[split_indices] = parent_means - offsets
             log_scales[split_indices] = child_log_scales
-            raw_cholesky[split_indices] = child_raw_cholesky
+            if raw_cholesky is not None:
+                raw_cholesky[split_indices] = child_raw_cholesky
             logit_opacities[split_indices] = child_logit_opacities
             logit_transmittances[split_indices] = child_logit_transmittances
 
             means = torch.cat([means, child_means], dim=0)
             log_scales = torch.cat([log_scales, child_log_scales], dim=0)
-            raw_cholesky = torch.cat([raw_cholesky, child_raw_cholesky], dim=0)
+            if raw_cholesky is not None:
+                raw_cholesky = torch.cat(
+                    [raw_cholesky, child_raw_cholesky],
+                    dim=0,
+                )
             logit_opacities = torch.cat([logit_opacities, child_logit_opacities], dim=0)
             logit_transmittances = torch.cat(
                 [logit_transmittances, child_logit_transmittances], dim=0
             )
             colors = torch.cat([colors, child_colors], dim=0)
-            disk_normals = torch.cat([disk_normals, child_disk_normals], dim=0)
+            if disk_normals is not None:
+                disk_normals = torch.cat(
+                    [disk_normals, child_disk_normals],
+                    dim=0,
+                )
 
         self.means = nn.Parameter(means.contiguous())
         self.log_scales = nn.Parameter(log_scales.contiguous())
-        self.raw_cholesky = nn.Parameter(raw_cholesky.contiguous())
+        if raw_cholesky is not None:
+            self.raw_cholesky = nn.Parameter(raw_cholesky.contiguous())
         self.logit_opacities = nn.Parameter(logit_opacities.contiguous())
         self.logit_transmittances = nn.Parameter(logit_transmittances.contiguous())
         self.colors = nn.Parameter(colors.contiguous())
-        self.disk_normals = nn.Parameter(disk_normals.contiguous())
+        if disk_normals is not None:
+            self.disk_normals = nn.Parameter(disk_normals.contiguous())
 
         return {
             "old_count": int(old_count),
@@ -683,15 +872,18 @@ def se3_delta_to_matrix(rotation_vectors, translations, dtype):
     return delta
 
 
-def normalize_image_for_save(image):
+def normalize_image_for_save(image, normalize=True):
     image = image.detach().float().cpu()
     if image.ndim == 4:
         image = image.squeeze(0)
     if image.ndim == 2:
         image = image.unsqueeze(0)
 
-    image = image - image.amin(dim=(-2, -1), keepdim=True)
-    image = image / image.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    if normalize:
+        image = image - image.amin(dim=(-2, -1), keepdim=True)
+        image = image / image.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    else:
+        image = image.clamp(0.0, 1.0)
 
     if image.shape[0] == 1:
         array = image.squeeze(0).numpy()
@@ -723,6 +915,16 @@ def save_debug_visuals(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
+        pred_stats = (
+            float(pred.min().item()),
+            float(pred.max().item()),
+            float(pred.mean().item()),
+        )
+        target_stats = (
+            float(target.min().item()),
+            float(target.max().item()),
+            float(target.mean().item()),
+        )
         raw_diff = (pred - target).abs()
         pred_edges = ultrasound_edge_map(
             pred,
@@ -743,17 +945,33 @@ def save_debug_visuals(
         edge_diff = (pred_edges - target_edges).abs()
 
         panels = [
-            ("target", target),
-            ("rendered", pred),
-            ("raw diff", raw_diff),
-            ("target edges", target_edges),
-            ("rendered edges", pred_edges),
-            ("edge diff", edge_diff),
+            (
+                "target "
+                f"{target_stats[0]:.3g}/{target_stats[1]:.3g}/{target_stats[2]:.3g}",
+                target,
+                False,
+            ),
+            (
+                "rendered "
+                f"{pred_stats[0]:.3g}/{pred_stats[1]:.3g}/{pred_stats[2]:.3g}",
+                pred,
+                False,
+            ),
+            ("raw diff", raw_diff, True),
+            ("target edges", target_edges, True),
+            ("rendered edges", pred_edges, True),
+            ("edge diff", edge_diff, True),
         ]
         if confidence is not None:
-            panels.append(("confidence", confidence))
+            panels.append(("confidence", confidence, True))
 
-        images = [add_label(normalize_image_for_save(tensor), label) for label, tensor in panels]
+        images = [
+            add_label(
+                normalize_image_for_save(tensor, normalize=normalize),
+                label,
+            )
+            for label, tensor, normalize in panels
+        ]
         width = sum(image.width for image in images)
         height = max(image.height for image in images)
         montage = Image.new("RGB", (width, height), color=(0, 0, 0))
@@ -762,6 +980,14 @@ def save_debug_visuals(
         for image in images:
             montage.paste(image, (x_offset, 0))
             x_offset += image.width
+
+        print(
+            f"debug step={step} "
+            f"target[min/max/mean]={target_stats[0]:.6g}/"
+            f"{target_stats[1]:.6g}/{target_stats[2]:.6g} "
+            f"rendered[min/max/mean]={pred_stats[0]:.6g}/"
+            f"{pred_stats[1]:.6g}/{pred_stats[2]:.6g}"
+        )
 
         montage.save(output_dir / f"step_{step:06d}_debug.png")
 
@@ -792,7 +1018,7 @@ def write_gaussians_ply(model, output_path, opacity_threshold=0.0):
         scales = model.effective_scales().detach().float().cpu().numpy()
         colors = colors_to_rgb_uint8(model.colors)
         opacities = torch.sigmoid(model.logit_opacities).detach().float().cpu().numpy().reshape(-1)
-        if hasattr(model, "disk_normals"):
+        if getattr(model, "disk_normals", None) is not None:
             normals = F.normalize(model.disk_normals.detach().float(), dim=-1, eps=1e-8).cpu().numpy()
         else:
             normals = np.zeros_like(means)
@@ -905,8 +1131,10 @@ def save_checkpoint(
             "edge_weight": args.edge_loss_weight,
             "intensity_weight": args.intensity_loss_weight,
             "sobel_weight": args.sobel_loss_weight,
-            "ultrasound_edges_weight": 1.0 - args.ssim_weight,
+            "ultrasound_edges_weight": args.ultrasound_edges_weight,
+            "l1_weight": args.l1_weight,
             "ssim_weight": args.ssim_weight,
+            "scale_prior_weight": args.scale_prior_weight,
             "ssim_window_size": args.ssim_window_size,
             "opacity_sparsity_weight": args.opacity_sparsity_weight,
             "filter_kernel_size": args.filter_kernel_size,
@@ -1364,6 +1592,132 @@ def choose_validation_indices(dataset_size, validation_slices, validation_fracti
     return validation_indices, training_indices
 
 
+def resize_adjusted_calibration(dataset, height, width, calibration_kwargs, args):
+    if hasattr(dataset, "datasets"):
+        original_sizes = {
+            tuple(source.original_image_size)
+            for source in dataset.datasets
+        }
+    else:
+        original_sizes = {tuple(dataset.original_image_size)}
+    if len(original_sizes) != 1:
+        raise ValueError(
+            "All image sources must have the same original dimensions when "
+            "using shared ultrasound calibration"
+        )
+
+    original_height, original_width = next(iter(original_sizes))
+    resize_x = float(width) / float(original_width)
+    resize_y = float(height) / float(original_height)
+
+    image_origin = calibration_kwargs["image_plane_origin_px"]
+    image_origin_x = (
+        float(image_origin[0]) * resize_x
+        if args.image_origin_x is None
+        else float(args.image_origin_x)
+    )
+    image_origin_y = (
+        float(image_origin[1]) * resize_y
+        if args.image_origin_y is None
+        else float(args.image_origin_y)
+    )
+    base_pixel_to_mm = (
+        float(calibration_kwargs["pixel_to_mm"])
+        if args.pixel_to_mm is None
+        else float(args.pixel_to_mm)
+    )
+    base_image_scale = (
+        float(calibration_kwargs["image_scale"])
+        if args.image_scale is None
+        else float(args.image_scale)
+    )
+    original_spacing = base_pixel_to_mm * base_image_scale
+    spacing_x = original_spacing / resize_x
+    spacing_y = original_spacing / resize_y
+
+    # A non-positive pixel_to_mm makes both renderers use the independent
+    # lateral and axial pixel spacings supplied below.
+    return image_origin_x, image_origin_y, 0.0, 1.0, spacing_x, spacing_y
+
+
+def random_means_from_tracked_bounds(
+    dataset,
+    num_gaussians,
+    height,
+    width,
+    image_t_probe,
+    image_plane_origin_px,
+    pixel_to_mm,
+    image_scale,
+    pixel_spacing,
+    padding_fraction=0.02,
+    device="cpu",
+):
+    dtype = torch.float32
+    calibrated_spacing = float(pixel_to_mm) * float(image_scale)
+    if calibrated_spacing > 0.0:
+        spacing_x = calibrated_spacing
+        spacing_y = calibrated_spacing
+    else:
+        spacing_x = float(pixel_spacing[0])
+        spacing_y = float(pixel_spacing[1])
+    if spacing_x <= 0.0 or spacing_y <= 0.0:
+        raise ValueError("Random tracked-volume initialization requires positive pixel spacing")
+
+    origin = torch.as_tensor(
+        image_plane_origin_px,
+        device=device,
+        dtype=dtype,
+    )
+    pixel_corners = torch.tensor(
+        [
+            [0.0, 0.0],
+            [float(width - 1), 0.0],
+            [float(width - 1), float(height - 1)],
+            [0.0, float(height - 1)],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    image_corners = torch.zeros((4, 4), device=device, dtype=dtype)
+    image_corners[:, 0] = (pixel_corners[:, 0] - origin[0]) * spacing_x
+    image_corners[:, 1] = (pixel_corners[:, 1] - origin[1]) * spacing_y
+    image_corners[:, 3] = 1.0
+    probe_t_image = torch.linalg.inv(
+        torch.as_tensor(image_t_probe, device=device, dtype=dtype)
+    )
+    probe_corners = (probe_t_image @ image_corners.T)
+
+    bounds_min = None
+    bounds_max = None
+    for sample in dataset:
+        pose = sample["pose"].to(device=device, dtype=dtype)
+        world_corners = (pose @ probe_corners).T[:, :3]
+        current_min = world_corners.min(dim=0).values
+        current_max = world_corners.max(dim=0).values
+        bounds_min = (
+            current_min
+            if bounds_min is None
+            else torch.minimum(bounds_min, current_min)
+        )
+        bounds_max = (
+            current_max
+            if bounds_max is None
+            else torch.maximum(bounds_max, current_max)
+        )
+
+    extent = (bounds_max - bounds_min).clamp_min(1e-3)
+    padding = extent * max(float(padding_fraction), 0.0)
+    bounds_min = bounds_min - padding
+    bounds_max = bounds_max + padding
+    means = bounds_min + torch.rand(
+        (int(num_gaussians), 3),
+        device=device,
+        dtype=dtype,
+    ) * (bounds_max - bounds_min)
+    return means, bounds_min, bounds_max
+
+
 def render_prediction(
     model,
     pose,
@@ -1464,6 +1818,23 @@ def ssim_loss(pred, target, window_size=11, data_range=1.0):
 
 
 def prediction_loss(pred, target, args, model=None):
+    pred_pixels = _as_bchw(pred)
+    target_pixels = _as_bchw(target)
+    if pred_pixels.shape[1] != target_pixels.shape[1]:
+        if pred_pixels.shape[1] == 1:
+            pred_pixels = pred_pixels.expand(
+                -1, target_pixels.shape[1], -1, -1
+            )
+        elif target_pixels.shape[1] == 1:
+            target_pixels = target_pixels.expand(
+                -1, pred_pixels.shape[1], -1, -1
+            )
+    if pred_pixels.shape != target_pixels.shape:
+        raise ValueError(
+            "L1 expects matching pred/target shapes, got "
+            f"{pred_pixels.shape} and {target_pixels.shape}"
+        )
+    pixel_loss = F.l1_loss(pred_pixels, target_pixels)
     edge_loss = ultrasound_edge_loss(
         pred,
         target,
@@ -1494,8 +1865,11 @@ def prediction_loss(pred, target, args, model=None):
         window_size=args.ssim_window_size,
         data_range=1.0,
     )
-    ssim_weight = min(max(float(args.ssim_weight), 0.0), 1.0)
-    loss = (1.0 - ssim_weight) * edge_loss + ssim_weight * structure_loss
+    loss = (
+        args.ultrasound_edges_weight * edge_loss
+        + args.ssim_weight * structure_loss
+        + args.l1_weight * pixel_loss
+    )
 
     if model is not None and args.scale_prior_weight > 0.0:
         loss = loss + args.scale_prior_weight * model.scale_prior_loss(
@@ -1511,6 +1885,56 @@ def prediction_loss(pred, target, args, model=None):
     if model is not None and args.opacity_sparsity_weight > 0.0:
         loss = loss + args.opacity_sparsity_weight * model.opacity_sparsity_loss()
     return loss
+
+
+def gaussian_learning_diagnostics(model, initial_means_sample, sample_indices):
+    diagnostics = {}
+    parameter_names = (
+        "means",
+        "log_scales",
+        "colors",
+        "logit_opacities",
+        "logit_transmittances",
+    )
+    for name in parameter_names:
+        parameter = getattr(model, name)
+        grad = parameter.grad
+        if grad is None:
+            diagnostics[f"{name}_grad_mean"] = 0.0
+            diagnostics[f"{name}_grad_max"] = 0.0
+            diagnostics[f"{name}_active_fraction"] = 0.0
+            continue
+        detached = grad.detach()
+        row_magnitude = detached.abs().reshape(len(detached), -1).amax(dim=-1)
+        diagnostics[f"{name}_grad_mean"] = float(detached.abs().mean().item())
+        diagnostics[f"{name}_grad_max"] = float(detached.abs().max().item())
+        diagnostics[f"{name}_active_fraction"] = float(
+            (row_magnitude > 1e-12).float().mean().item()
+        )
+
+    current_sample = model.means.detach()[sample_indices]
+    displacement = torch.linalg.norm(
+        current_sample - initial_means_sample,
+        dim=-1,
+    )
+    diagnostics["mean_displacement"] = float(displacement.mean().item())
+    diagnostics["max_displacement"] = float(displacement.max().item())
+    return diagnostics
+
+
+def format_learning_diagnostics(diagnostics):
+    return (
+        "learn "
+        f"visible_grad={100.0 * diagnostics['means_active_fraction']:.2f}% "
+        f"mean_grad={diagnostics['means_grad_mean']:.3g} "
+        f"max_grad={diagnostics['means_grad_max']:.3g} "
+        f"move={diagnostics['mean_displacement']:.4g}/"
+        f"{diagnostics['max_displacement']:.4g} "
+        f"scale_grad={diagnostics['log_scales_grad_mean']:.3g} "
+        f"intensity_grad={diagnostics['colors_grad_mean']:.3g} "
+        f"opacity_grad={diagnostics['logit_opacities_grad_mean']:.3g} "
+        f"trans_grad={diagnostics['logit_transmittances_grad_mean']:.3g}"
+    )
 
 
 @torch.no_grad()
@@ -1563,6 +1987,11 @@ def evaluate_validation_loss(
 
 
 def train(args):
+    if args.renderer_backend == "ultragray_cuda":
+        from ultragray_native_training import train_native_ultragray
+
+        return train_native_ultragray(args)
+
     if args.filter_kernel_size % 2 == 0:
         raise ValueError("--filter-kernel-size must be odd")
 
@@ -1581,6 +2010,7 @@ def train(args):
             image_size=(args.height, args.width),
             grayscale=args.grayscale,
             low_intensity_threshold=args.low_intensity_threshold,
+            image_value_scale=args.image_value_scale,
         )
         source_names = [dataset.source_name]
     else:
@@ -1590,11 +2020,40 @@ def train(args):
             image_size=(args.height, args.width),
             grayscale=args.grayscale,
             low_intensity_threshold=args.low_intensity_threshold,
+            image_value_scale=args.image_value_scale,
         )
         source_names = [source_dataset.source_name for source_dataset in dataset.datasets]
-    source_validation = choose_source_validation_indices(dataset, args.validation_sources)
+    explicit_validation_dataset = None
+    if args.image_dir_val:
+        if len(args.image_dir_val) == 1:
+            explicit_validation_dataset = TrackedUltrasoundDataset(
+                image_dir=args.image_dir_val[0],
+                poses_path=args.pose_val[0] if args.pose_val else None,
+                image_size=(args.height, args.width),
+                grayscale=args.grayscale,
+                low_intensity_threshold=args.low_intensity_threshold,
+                image_value_scale=args.image_value_scale,
+            )
+        else:
+            explicit_validation_dataset = MultiTrackedUltrasoundDataset(
+                image_dirs=args.image_dir_val,
+                poses_paths=args.pose_val,
+                image_size=(args.height, args.width),
+                grayscale=args.grayscale,
+                low_intensity_threshold=args.low_intensity_threshold,
+                image_value_scale=args.image_value_scale,
+            )
+
+    source_validation = (
+        None
+        if explicit_validation_dataset is not None
+        else choose_source_validation_indices(dataset, args.validation_sources)
+    )
     validation_source_names = []
-    if source_validation is None:
+    if explicit_validation_dataset is not None:
+        validation_indices = []
+        training_indices = list(range(len(dataset)))
+    elif source_validation is None:
         validation_indices, training_indices = choose_validation_indices(
             len(dataset),
             args.validation_slices,
@@ -1608,12 +2067,21 @@ def train(args):
         ]
     train_dataset = Subset(dataset, training_indices) if validation_indices else dataset
     validation_loader = (
-        DataLoader(Subset(dataset, validation_indices), batch_size=1, shuffle=False)
-        if validation_indices
-        else None
+        DataLoader(explicit_validation_dataset, batch_size=1, shuffle=False)
+        if explicit_validation_dataset is not None
+        else (
+            DataLoader(Subset(dataset, validation_indices), batch_size=1, shuffle=False)
+            if validation_indices
+            else None
+        )
     )
     loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    if validation_indices:
+    if explicit_validation_dataset is not None:
+        print(
+            f"using {len(dataset)} explicit training slices and "
+            f"{len(explicit_validation_dataset)} explicit validation slices"
+        )
+    elif validation_indices:
         print(
             f"using {len(training_indices)} training slices and "
             f"{len(validation_indices)} fixed validation slices"
@@ -1622,23 +2090,59 @@ def train(args):
             print("validation sources: " + "; ".join(validation_source_names))
 
     calibration_kwargs = dataset.calibration.to_renderer_kwargs()
-    image_origin = calibration_kwargs["image_plane_origin_px"]
-    pixel_to_mm = calibration_kwargs["pixel_to_mm"] if args.pixel_to_mm is None else args.pixel_to_mm
-    image_scale = calibration_kwargs["image_scale"] if args.image_scale is None else args.image_scale
-    image_origin_x = image_origin[0] if args.image_origin_x is None else args.image_origin_x
-    image_origin_y = image_origin[1] if args.image_origin_y is None else args.image_origin_y
+    (
+        image_origin_x,
+        image_origin_y,
+        pixel_to_mm,
+        image_scale,
+        pixel_spacing_x,
+        pixel_spacing_y,
+    ) = resize_adjusted_calibration(
+        dataset,
+        args.height,
+        args.width,
+        calibration_kwargs,
+        args,
+    )
+    args.pixel_spacing_x = pixel_spacing_x
+    args.pixel_spacing_y = pixel_spacing_y
+    print(
+        "resize-adjusted calibration: "
+        f"origin=({image_origin_x:.3f}, {image_origin_y:.3f}) px, "
+        f"spacing=({pixel_spacing_x:.6f}, {pixel_spacing_y:.6f}) mm/px"
+    )
     checkpoint_calibration_metadata = {
         "image_t_probe": calibration_kwargs["image_t_probe"].tolist(),
         "image_plane_origin_px": [image_origin_x, image_origin_y],
         "pixel_to_mm": pixel_to_mm,
         "image_scale": image_scale,
+        "pixel_spacing_x": pixel_spacing_x,
+        "pixel_spacing_y": pixel_spacing_y,
     }
 
     channels = 1 if args.grayscale else 3
     initial_means = None
     initial_colors = None
     initial_opacities = None
-    if args.init == "svrtk":
+    if args.init == "random":
+        initial_means, bounds_min, bounds_max = random_means_from_tracked_bounds(
+            train_dataset,
+            args.num_gaussians,
+            args.height,
+            args.width,
+            image_t_probe=calibration_kwargs["image_t_probe"],
+            image_plane_origin_px=(image_origin_x, image_origin_y),
+            pixel_to_mm=pixel_to_mm,
+            image_scale=image_scale,
+            pixel_spacing=(args.pixel_spacing_x, args.pixel_spacing_y),
+            device=device,
+        )
+        print(
+            f"initialized {len(initial_means)} random Gaussians inside tracked bounds: "
+            f"min={bounds_min.detach().cpu().tolist()}, "
+            f"max={bounds_max.detach().cpu().tolist()}"
+        )
+    elif args.init == "svrtk":
         svrtk_init = init_SVRTK(
             train_dataset,
             args.num_gaussians,
@@ -1675,7 +2179,16 @@ def train(args):
         initial_means=initial_means,
         initial_colors=initial_colors,
         initial_opacities=initial_opacities,
+        lean_storage=args.renderer_backend == "ultragray_cuda",
     ).to(device)
+    diagnostic_sample_count = min(model.num_gaussians, 4096)
+    diagnostic_indices = torch.linspace(
+        0,
+        model.num_gaussians - 1,
+        diagnostic_sample_count,
+        device=device,
+    ).long()
+    initial_means_sample = model.means.detach()[diagnostic_indices].clone()
     pose_corrector = None
     if args.pose_correction == "source":
         pose_corrector = SourcePoseCorrection(
@@ -1752,6 +2265,15 @@ def train(args):
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulated_count)
 
+        should_log = step == 1 or step % args.log_every == 0
+        learning_diagnostics = None
+        if should_log:
+            learning_diagnostics = gaussian_learning_diagnostics(
+                model,
+                initial_means_sample,
+                diagnostic_indices,
+            )
+
         loss = torch.as_tensor(accumulated_loss / accumulated_count, device=device)
         scaler.step(optimizer)
         scaler.update()
@@ -1759,6 +2281,18 @@ def train(args):
             min_scale_mm=args.min_scale_mm,
             max_scale_mm=args.max_scale_mm,
         )
+        if learning_diagnostics is not None:
+            updated_sample = model.means.detach()[diagnostic_indices]
+            displacement = torch.linalg.norm(
+                updated_sample - initial_means_sample,
+                dim=-1,
+            )
+            learning_diagnostics["mean_displacement"] = float(
+                displacement.mean().item()
+            )
+            learning_diagnostics["max_displacement"] = float(
+                displacement.max().item()
+            )
 
         if (
             args.densify_every > 0
@@ -1781,6 +2315,14 @@ def train(args):
                     {"params": pose_corrector.parameters(), "lr": args.pose_correction_lr}
                 )
             optimizer = torch.optim.Adam(optimizer_parameters)
+            diagnostic_sample_count = min(model.num_gaussians, 4096)
+            diagnostic_indices = torch.linspace(
+                0,
+                model.num_gaussians - 1,
+                diagnostic_sample_count,
+                device=device,
+            ).long()
+            initial_means_sample = model.means.detach()[diagnostic_indices].clone()
             if args.log_densify:
                 print(
                     "densify/prune "
@@ -1845,8 +2387,10 @@ def train(args):
                 f"step={step:04d} loss={loss.item():.6f} "
                 f"val_loss={validation_loss:.6f} gaussians={model.num_gaussians}"
             )
-        elif step == 1 or step % args.log_every == 0:
+        elif should_log:
             print(f"step={step:04d} loss={loss.item():.6f} gaussians={model.num_gaussians}")
+        if learning_diagnostics is not None:
+            print(format_learning_diagnostics(learning_diagnostics))
 
         if args.output and args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
             step_output = checkpoint_path_for_step(args.output, step)

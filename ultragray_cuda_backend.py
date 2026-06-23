@@ -8,6 +8,8 @@ import torch
 _ULTRAGRAY_RASTERIZER = None
 _ULTRAGRAY_ROOT = None
 _UTF8_HASH_PATCHED = False
+_IDENTITY_QUATERNIONS = {}
+_IDENTITY_VIEWS = {}
 
 
 def _candidate_repo_paths(configured_path=None):
@@ -90,6 +92,33 @@ def _matrix4(value, device, dtype):
     return matrix
 
 
+def _identity_quaternions(count, reference):
+    key = (reference.device, reference.dtype)
+    quats = _IDENTITY_QUATERNIONS.get(key)
+    if quats is None or len(quats) != count:
+        quats = torch.zeros(
+            (count, 4),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        quats[:, 0] = 1.0
+        _IDENTITY_QUATERNIONS[key] = quats
+    return quats
+
+
+def _identity_view(reference):
+    key = (reference.device, reference.dtype)
+    view = _IDENTITY_VIEWS.get(key)
+    if view is None:
+        view = torch.eye(
+            4,
+            device=reference.device,
+            dtype=reference.dtype,
+        ).unsqueeze(0)
+        _IDENTITY_VIEWS[key] = view
+    return view
+
+
 def _camera_to_world(
     slice_to_world,
     image_t_probe,
@@ -167,11 +196,10 @@ def render_ultrasound_cuda(
         image_width,
     )
     world_to_camera = torch.linalg.inv(camera_to_world)
-    means_h = torch.cat(
-        [means, torch.ones_like(means[:, :1])],
-        dim=-1,
+    camera_means = (
+        means @ world_to_camera[:3, :3].T
+        + world_to_camera[:3, 3]
     )
-    camera_means = (world_to_camera @ means_h.T).T[:, :3]
 
     opacity_probability = torch.sigmoid(opacities).reshape(-1)
     if (
@@ -192,12 +220,7 @@ def render_ultrasound_cuda(
 
     # Model scale order is lateral, axial, elevational. CUDA camera order is X, Y, Z.
     camera_scales = scales[:, [0, 2, 1]]
-    quats = torch.zeros(
-        (len(camera_means), 4),
-        device=means.device,
-        dtype=means.dtype,
-    )
-    quats[:, 0] = 1.0
+    quats = _identity_quaternions(len(camera_means), means)
 
     intensities = colors.clamp(0.0, 1.0) * opacity_probability[:, None]
     if transmittances is None or not shadowing:
@@ -209,11 +232,7 @@ def render_ultrasound_cuda(
             local_transmittance = (1.0 - attenuation).clamp(0.0, 1.0)
 
     rasterizer = load_ultragray_rasterizer(ultragray_repo_path)
-    identity_view = torch.eye(
-        4,
-        device=means.device,
-        dtype=means.dtype,
-    ).unsqueeze(0)
+    identity_view = _identity_view(means)
     opening_width = float(image_width) * spacing_x
     far_plane = float(image_height) * spacing_y
 
