@@ -1,0 +1,46 @@
+python checkpoint_to_mesh.py \
+  --checkpoint outputs/checkpoints/vanilla_gaussians_all.pt \
+  --output outputs/checkpoints/vanilla_gaussians_mesh.ply \
+  --resolution 512 \
+  --weight-mode echo \
+  --level 0.0001
+
+python render_arbitrary_slice.py `
+  --checkpoint outputs2/vanilla_gaussians_all29.pt `
+  --image-dir spine_data/images_train.npy `
+  --poses spine_data/poses_train.npy `
+  --slice-index 500 `
+  --offset-mm 0 0 10 `
+  --offset-rotation-deg 0 15 0 `
+  --output outputs/slice.png `
+  --save-pose
+
+python render_arbitrary_slice.py \
+  --checkpoint outputs/checkpoints/vanilla_gaussians_all.pt \
+  --image-dir spine_data/images_train.npy \
+  --poses spine_data/poses_train.npy \
+  --slice-index 500 \
+  --offset-mm 0 0 10 \
+  --offset-rotation-deg 0 15 0 \
+  --output outputs2/slice.png \
+  --save-pose \
+  --display-normalize \
+  --scene \
+  --scene-output outputs2/rendered_arbitrary_slice_scene.png
+
+python render_arbitrary_slice.py \
+  --checkpoint outputs/checkpoints/vanilla_gaussians_all.pt \
+  --translation-mm 0 -30 -50 \
+  --rotation-deg 0 0 90 \
+  --native-scene-center 0 0 0 \
+  --height 658 \
+  --width 372 \
+  --output outputs2/arbitrary_slice.png \
+  --scene \
+  --display-normalize \
+  --scene \
+  --scene-output outputs2/rendered_arbitrary_slice_scene.png 
+
+splat-transform -w `
+  "C:\Users\Patrick\Documents\MAsc\Gaussian-Splatting\outputs2\vanilla_gaussians_all30.ply" `
+  "C:\Users\Patrick\Documents\MAsc\Gaussian-Splatting\outputs2\vanilla_gaussians_all30.sog"

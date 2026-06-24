@@ -579,39 +579,90 @@ def _augment_camera_poses(camera_to_worlds, args):
     return cameras
 
 
-def _sample_means_from_frames(
+def _sample_means_from_bright_pixels(
+    dataset,
     camera_to_worlds,
     count,
     opening_width,
     far_plane,
     elevational_jitter,
+    intensity_threshold,
+    intensity_power,
+    pixel_stride,
 ):
     device = camera_to_worlds.device
     means = torch.empty((count, 3), device=device)
-    chunk_size = 100_000
-    for start in range(0, count, chunk_size):
-        end = min(start + chunk_size, count)
-        size = end - start
-        camera_ids = torch.randint(
-            0,
-            len(camera_to_worlds),
-            (size,),
-            device=device,
+    initial_echo = torch.empty((count,), device=device)
+    frame_ids = torch.randint(0, len(dataset), (count,), device="cpu")
+    frame_counts = torch.bincount(frame_ids, minlength=len(dataset))
+    stride = max(int(pixel_stride), 1)
+    threshold = float(intensity_threshold)
+    power = float(intensity_power)
+    write_offset = 0
+    fallback_frames = 0
+
+    for frame_index, frame_count in enumerate(frame_counts.tolist()):
+        if frame_count == 0:
+            continue
+        image = dataset[frame_index]["image"].detach().float().cpu()
+        if image.ndim == 3:
+            image = image.mean(dim=0)
+        sampled = image[::stride, ::stride]
+        sampled_height, sampled_width = sampled.shape
+        weights = (sampled - threshold).clamp_min(0.0).pow(power).reshape(-1)
+        if float(weights.sum()) <= 0.0:
+            weights = sampled.clamp_min(0.0).pow(power).reshape(-1)
+            fallback_frames += 1
+        if float(weights.sum()) <= 0.0:
+            weights = torch.ones_like(weights)
+            fallback_frames += 1
+
+        selected = torch.multinomial(
+            weights,
+            frame_count,
+            replacement=True,
         )
-        cameras = camera_to_worlds[camera_ids]
-        local = torch.empty((size, 3), device=device)
-        local[:, 0].uniform_(-0.5 * opening_width, 0.5 * opening_width)
-        local[:, 1].uniform_(-elevational_jitter, elevational_jitter)
-        local[:, 2].uniform_(0.0, far_plane)
-        means[start:end] = (
-            torch.bmm(cameras[:, :3, :3], local.unsqueeze(-1)).squeeze(-1)
-            + cameras[:, :3, 3]
+        rows = torch.div(selected, sampled_width, rounding_mode="floor")
+        columns = selected % sampled_width
+        source_rows = rows.float() * stride
+        source_columns = columns.float() * stride
+        height, width = image.shape
+
+        lateral = (
+            (source_columns + 0.5 + torch.rand(frame_count) - 0.5)
+            / float(width)
+            - 0.5
+        ) * float(opening_width)
+        axial = (
+            (source_rows + torch.rand(frame_count) * stride)
+            / max(float(height - 1), 1.0)
+        ).clamp(0.0, 1.0) * float(far_plane)
+        elevational = (
+            torch.rand(frame_count) * 2.0 - 1.0
+        ) * float(elevational_jitter)
+        local = torch.stack(
+            [lateral, elevational, axial],
+            dim=1,
+        ).to(device)
+        camera = camera_to_worlds[frame_index]
+        end = write_offset + frame_count
+        means[write_offset:end] = (
+            local @ camera[:3, :3].T + camera[:3, 3]
         )
-    return means
+        initial_echo[write_offset:end] = sampled.reshape(-1)[selected].to(device)
+        write_offset = end
+
+    print(
+        "native SVRTK intensity sampling: "
+        f"threshold={threshold}, power={power}, stride={stride}, "
+        f"fallback_frames={fallback_frames}"
+    )
+    return means, initial_echo.clamp(0.0, 1.0)
 
 
 def _create_splats(
     args,
+    dataset,
     camera_to_worlds,
     opening_width,
     far_plane,
@@ -619,6 +670,7 @@ def _create_splats(
     device,
 ):
     count = int(args.num_gaussians)
+    initial_echo = None
     if args.init == "random":
         init_device = (
             torch.device("cpu")
@@ -637,12 +689,16 @@ def _create_splats(
             dtype=torch.float32,
         ).to(device)
     else:
-        means = _sample_means_from_frames(
+        means, initial_echo = _sample_means_from_bright_pixels(
+            dataset,
             camera_to_worlds,
             count,
             opening_width,
             far_plane,
             max(0.1 * float(args.initial_scale_z), 1e-4),
+            args.intensity_threshold,
+            args.svrtk_intensity_power,
+            args.pixel_stride,
         )
         # Existing config scale values are millimetres. Native renderer uses cm.
         camera_scale = torch.tensor(
@@ -673,7 +729,10 @@ def _create_splats(
         (count, coefficients, 1),
         device=quat_device,
     )
-    colors[:, 0, :] = (0.1 - 0.5) / C0
+    if initial_echo is None:
+        colors[:, 0, :] = (0.1 - 0.5) / C0
+    else:
+        colors[:, 0, 0] = (initial_echo.to(quat_device) - 0.5) / C0
     colors = colors.to(device)
     return torch.nn.ParameterDict(
         {
@@ -1082,6 +1141,7 @@ def train_native_ultragray(args):
     )
     splats = _create_splats(
         args,
+        train_dataset,
         all_cameras,
         opening_width,
         far_plane,

@@ -33,6 +33,7 @@ TRAIN_CONFIG_DEFAULTS = {
     "svrtk_fill_fraction": 0.2,
     "svrtk_fill_opacity": 0.05,
     "svrtk_fill_endpoint_margin": 0.1,
+    "svrtk_intensity_power": 2.0,
     "grid_depth": 64,
     "grid_height": 64,
     "grid_width": 64,
@@ -251,6 +252,8 @@ def load_train_config(config_path):
         raise ValueError("config svrtk_fill_opacity must be between 0 and 1")
     if not 0.0 <= float(config["svrtk_fill_endpoint_margin"]) < 0.5:
         raise ValueError("config svrtk_fill_endpoint_margin must be in [0, 0.5)")
+    if float(config["svrtk_intensity_power"]) <= 0.0:
+        raise ValueError("config svrtk_intensity_power must be positive")
     ssim_weight = min(max(float(config["ssim_weight"]), 0.0), 1.0)
     ultrasound_edges_weight = float(config["ultrasound_edges_weight"])
     l1_weight = float(config["l1_weight"])
